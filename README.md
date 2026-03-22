@@ -150,8 +150,4 @@ This repository is licensed under the GNU Affero General Public License v3.0. Se
 
 That choice is deliberate for this project:
 
-- it keeps the code open source,
-- it requires network-deployed modifications to be shared back,
-- it preserves more control over hosted forks than permissive licenses like MIT or Apache-2.0.
-
 The license does not grant trademark rights to the project name, branding, or logos.
