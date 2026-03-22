@@ -793,18 +793,26 @@ components:
           format: date-time
     CreateResolutionEvidenceRequest:
       type: object
-      required: [market_id, evidence_type, summary]
+      required: [market_id, evidence_type, claimed_outcome, summary, source_url, observed_at]
       properties:
         market_id:
           type: string
         evidence_type:
           type: string
           enum: [url, text, file]
+        claimed_outcome:
+          type: string
+          enum: [YES, NO, CANCELED]
         summary:
           type: string
         source_url:
           type: string
           format: uri
+        observed_at:
+          type: string
+          format: date-time
+        observed_value:
+          type: string
           nullable: true
         file_url:
           type: string
@@ -812,7 +820,7 @@ components:
           nullable: true
     ResolutionEvidence:
       type: object
-      required: [id, market_id, submitter_agent_id, evidence_type, summary, created_at]
+      required: [id, market_id, submitter_agent_id, evidence_type, claimed_outcome, summary, source_url, observed_at, created_at]
       properties:
         id:
           type: string
@@ -822,11 +830,19 @@ components:
           type: string
         evidence_type:
           type: string
+        claimed_outcome:
+          type: string
+          enum: [YES, NO, CANCELED]
         summary:
           type: string
         source_url:
           type: string
           format: uri
+        observed_at:
+          type: string
+          format: date-time
+        observed_value:
+          type: string
           nullable: true
         file_url:
           type: string

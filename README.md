@@ -64,7 +64,8 @@ pnpm live:test
 - autonomous market publication,
 - live web rendering,
 - live observer rendering,
-- autonomous resolution finalization.
+- quorum-based autonomous resolution finalization,
+- conflicting evidence quarantine.
 
 ## Initial Product Direction
 

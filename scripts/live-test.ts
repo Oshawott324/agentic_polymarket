@@ -205,31 +205,95 @@ async function main() {
       items: Array<{ id: string; title: string }>;
     };
 
+    const btcMarket = markets.items.find((entry) =>
+      entry.title.includes("BTC trade above $100k"),
+    );
+    const fedMarket = markets.items.find((entry) =>
+      entry.title.includes("Fed cut rates before July 31, 2026"),
+    );
+
+    if (!btcMarket || !fedMarket) {
+      throw new Error(`Expected BTC and Fed markets, received ${JSON.stringify(markets.items)}`);
+    }
+
     await waitForText("http://127.0.0.1:3000", "Will BTC trade above $100k by June 30, 2026?");
     await waitForText("http://127.0.0.1:3001/proposals", "Will the Fed cut rates before July 31, 2026?");
 
-    const evidenceResponse = await fetch("http://127.0.0.1:4006/v1/resolution-evidence", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({
-        market_id: markets.items[0].id,
-        evidence_type: "text",
-        summary: "Outcome YES based on official source.",
-      }),
-    });
+    for (const agentId of ["resolver-alpha", "resolver-beta"]) {
+      const evidenceResponse = await fetch("http://127.0.0.1:4006/v1/resolution-evidence", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-agent-id": agentId,
+        },
+        body: JSON.stringify({
+          market_id: btcMarket.id,
+          evidence_type: "url",
+          claimed_outcome: "YES",
+          summary: "Outcome YES confirmed from official source.",
+          source_url: "https://www.cmegroup.com/markets/cryptocurrencies/bitcoin.html",
+          observed_at: "2026-06-30T20:00:00Z",
+          observed_value: "100500",
+        }),
+      });
 
-    if (!evidenceResponse.ok) {
-      throw new Error(`Resolution evidence submission failed with ${evidenceResponse.status}`);
+      if (!evidenceResponse.ok) {
+        throw new Error(`Resolution evidence submission failed with ${evidenceResponse.status}`);
+      }
+    }
+
+    const conflictingEvidence = [
+      {
+        agentId: "resolver-gamma",
+        claimed_outcome: "YES",
+        summary: "Outcome YES according to official rate decision source.",
+      },
+      {
+        agentId: "resolver-delta",
+        claimed_outcome: "NO",
+        summary: "Outcome NO according to official rate decision source.",
+      },
+    ];
+
+    for (const entry of conflictingEvidence) {
+      const evidenceResponse = await fetch("http://127.0.0.1:4006/v1/resolution-evidence", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-agent-id": entry.agentId,
+        },
+        body: JSON.stringify({
+          market_id: fedMarket.id,
+          evidence_type: "url",
+          claimed_outcome: entry.claimed_outcome,
+          summary: entry.summary,
+          source_url: "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm",
+          observed_at: "2026-07-31T19:00:00Z",
+          observed_value: "unchanged",
+        }),
+      });
+
+      if (!evidenceResponse.ok) {
+        throw new Error(`Conflicting evidence submission failed with ${evidenceResponse.status}`);
+      }
     }
 
     const resolutions = (await waitForJson("http://127.0.0.1:4006/v1/resolutions")) as {
       items: Array<{ market_id: string; status: string; final_outcome: string | null }>;
     };
-    const resolution = resolutions.items.find((entry) => entry.market_id === markets.items[0].id);
-    if (!resolution || resolution.status !== "finalized" || resolution.final_outcome !== "YES") {
+    const finalizedResolution = resolutions.items.find((entry) => entry.market_id === btcMarket.id);
+    const quarantinedResolution = resolutions.items.find((entry) => entry.market_id === fedMarket.id);
+
+    if (
+      !finalizedResolution ||
+      finalizedResolution.status !== "finalized" ||
+      finalizedResolution.final_outcome !== "YES"
+    ) {
       throw new Error(`Unexpected resolution state: ${JSON.stringify(resolutions.items)}`);
+    }
+
+    if (!quarantinedResolution || quarantinedResolution.status !== "quarantined") {
+      throw new Error(`Expected quarantined resolution state: ${JSON.stringify(resolutions.items)}`);
     }
 
     console.log("live-test ok");
