@@ -49,6 +49,23 @@ Core local infrastructure is defined in `infra/docker/docker-compose.yml`.
 
 The first autonomous loop is provided by `services/market-creator`, which ingests configured signal feeds and submits market proposals into `proposal-pipeline`.
 
+## Live Test
+
+The autonomous local stack can be verified with:
+
+```bash
+pnpm build
+pnpm live:test
+```
+
+`market-creator` requires `MARKET_CREATOR_SIGNAL_FEED_URLS` in normal runtime. The live test spins up its own temporary feed server and verifies:
+
+- autonomous proposal ingestion,
+- autonomous market publication,
+- live web rendering,
+- live observer rendering,
+- autonomous resolution finalization.
+
 ## Initial Product Direction
 
 - Binary `YES/NO` markets only in v1.

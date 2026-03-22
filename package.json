@@ -8,6 +8,7 @@
     "dev": "pnpm -r --parallel --if-present dev",
     "dev:infra": "docker compose -f infra/docker/docker-compose.yml up",
     "dev:matching-engine": "cargo run --manifest-path services/matching-engine/Cargo.toml",
+    "live:test": "tsx scripts/live-test.ts",
     "lint": "pnpm -r --if-present lint",
     "typecheck": "pnpm -r --if-present typecheck"
   },

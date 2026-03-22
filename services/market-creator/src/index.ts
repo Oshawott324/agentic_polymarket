@@ -52,6 +52,20 @@ async function submitSignal(signal: MarketSignal) {
   };
 }
 
+async function waitForProposalPipeline() {
+  for (;;) {
+    try {
+      const response = await fetch(`${proposalPipelineUrl}/health`);
+      if (response.ok) {
+        return;
+      }
+    } catch {}
+
+    console.log("[market-creator] waiting for proposal-pipeline health");
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+}
+
 async function runLoop() {
   const signals = await loadSignals();
   console.log(`[market-creator] scanning ${signals.length} signals`);
@@ -72,7 +86,10 @@ console.log(
   `[market-creator] starting autonomous loop against ${proposalPipelineUrl} every ${loopIntervalMs}ms`,
 );
 
-void runLoop();
-setInterval(() => {
-  void runLoop();
-}, loopIntervalMs);
+void (async () => {
+  await waitForProposalPipeline();
+  await runLoop();
+  setInterval(() => {
+    void runLoop();
+  }, loopIntervalMs);
+})();

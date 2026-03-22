@@ -15,6 +15,7 @@ type Proposal = {
   signal_source_type?: "calendar" | "news" | "agent";
   status: "queued" | "published" | "suppressed";
   confidence_score: number;
+  observation_count: number;
   autonomy_note: string;
   linked_market_id?: string;
   created_at: string;
@@ -59,11 +60,14 @@ function scoreProposal(input: {
     confidenceScore += 0.05;
   }
 
-  const status: Proposal["status"] = confidenceScore >= 0.8 ? "published" : "queued";
+  const status: Proposal["status"] =
+    confidenceScore >= 0.8 ? "published" : confidenceScore >= 0.45 ? "queued" : "suppressed";
   const autonomyNote =
     status === "published"
       ? "Published automatically because confidence exceeded the autonomous publication threshold."
-      : "Queued for a later autonomous publication pass because confidence did not exceed the threshold.";
+      : status === "queued"
+        ? "Queued for autonomous republication once repeated signals increase confidence."
+        : "Suppressed automatically because confidence was too low.";
 
   return {
     confidenceScore,
@@ -96,6 +100,31 @@ async function publishMarketFromProposal(proposal: Proposal) {
   return payload.id ?? proposal.id;
 }
 
+async function maybePublishQueuedProposal(proposal: Proposal) {
+  if (proposal.status !== "queued") {
+    return;
+  }
+
+  const adjustedConfidence = Math.min(1, proposal.confidence_score + (proposal.observation_count - 1) * 0.12);
+  proposal.confidence_score = adjustedConfidence;
+
+  if (adjustedConfidence < 0.8) {
+    proposal.autonomy_note =
+      "Queued for autonomous republication until repeated signals raise confidence above the publication threshold.";
+    return;
+  }
+
+  try {
+    proposal.linked_market_id = await publishMarketFromProposal(proposal);
+    proposal.status = "published";
+    proposal.autonomy_note =
+      "Published automatically after repeated signal confirmations raised confidence above the publication threshold.";
+  } catch (error) {
+    proposal.status = "suppressed";
+    proposal.autonomy_note = `Suppressed because market publication failed: ${String(error)}`;
+  }
+}
+
 app.post("/v1/market-proposals", async (request, reply) => {
   const body = request.body as {
     proposer_agent_id?: string;
@@ -115,6 +144,8 @@ app.post("/v1/market-proposals", async (request, reply) => {
     `${body.category ?? "uncategorized"}:${body.title ?? "Untitled proposal"}:${body.close_time ?? ""}`;
   const existing = proposalsByDedupeKey.get(dedupeKey);
   if (existing) {
+    existing.observation_count += 1;
+    await maybePublishQueuedProposal(existing);
     return {
       ...existing,
       deduped: true,
@@ -137,6 +168,7 @@ app.post("/v1/market-proposals", async (request, reply) => {
     signal_source_type: body.signal_source_type,
     status: decision.status,
     confidence_score: decision.confidenceScore,
+    observation_count: 1,
     autonomy_note: decision.autonomyNote,
     created_at: new Date().toISOString(),
   };
