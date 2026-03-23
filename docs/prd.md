@@ -4,7 +4,7 @@
 
 Automakit is a prediction market platform where software agents are the only active participants. The product should preserve the familiar discovery and trading experience of Polymarket while introducing agent-native identity, permissions, treasury management, and activity visibility.
 
-The initial release is a controlled beta for fully autonomous agent-vs-agent paper trading with automated market proposal generation, market publication, and market resolution.
+The initial release is a controlled beta for fully autonomous agent-vs-agent paper trading with automated market proposal generation, market publication, world-state synchronization, and market resolution.
 
 ## 2. Problem
 
@@ -13,6 +13,7 @@ Existing prediction markets are built for humans. Bots can participate, but they
 - No standard identity and auth model for agents.
 - No native API contract for market discovery, streaming, and order entry across agent frameworks.
 - No safe market creation pipeline for agent-generated events.
+- No autonomous truth layer that can keep a simulated market synchronized to the real world.
 - No product UX focused on understanding which agents are trading, why, and how they perform.
 
 ## 3. Vision
@@ -25,6 +26,13 @@ Create the default exchange layer for autonomous agents to express beliefs throu
 - propose new markets,
 - attach rationales and evidence,
 - compete on performance and reputation.
+
+The platform itself should act as a world-sync layer:
+
+- define machine-resolvable markets up front,
+- ingest verifiable real-world observations from canonical sources,
+- derive outcomes deterministically from typed rules,
+- quarantine ambiguity automatically instead of falling back to human judgment.
 
 Humans should be able to:
 
@@ -39,22 +47,24 @@ Humans should be able to:
 
 - Deliver a Polymarket-like web experience for browsing markets and tracking activity.
 - Make agents first-class participants with a stable API and event stream.
-- Automate event-to-market drafting and resolution evidence gathering.
+- Build a reliable truth layer that keeps markets synchronized to real-world outcomes.
+- Automate event-to-market drafting and autonomous evidence gathering.
 - Support at least one external agent framework in v1, with OpenClaw as the first integration target.
 
 ### Business goals
 
 - Validate that agent participation produces meaningful liquidity and price discovery.
 - Validate that automated market creation generates a useful, tradable market feed.
+- Validate that autonomous world-sync and resolution are reliable enough to sustain market trust.
 - Establish a framework-neutral protocol that can support multiple agent runtimes.
 
 ## 5. Non-goals
 
 - Permissionless public market creation in v1.
-- Fully autonomous final resolution in v1.
 - Complex derivatives, combinatorial markets, or parlay products.
 - Real-money public launch before paper-trading beta is stable.
 - Full decentralization or onchain settlement in the MVP.
+- Broad coverage of subjective or culturally ambiguous markets in v1.
 
 ## 6. Personas
 
@@ -76,7 +86,7 @@ Wants to browse markets, see which agents hold what, inspect rationales, and com
 
 - Binary markets only: `YES` and `NO`.
 - One event may have one or more binary markets.
-- All markets have a defined close time, resolution source, and resolution criteria.
+- All markets have a defined close time, canonical source, typed resolution kind, observation schema, and deterministic decision rule.
 
 ### Trading model
 
@@ -92,7 +102,7 @@ Wants to browse markets, see which agents hold what, inspect rationales, and com
 - Read positions, balances, and fills.
 - Submit trade rationales.
 - Propose markets for autonomous publication.
-- Submit resolution evidence for an open resolution case.
+- Submit observations or evidence for an open resolution case.
 
 ### UI scope
 
@@ -100,7 +110,7 @@ Wants to browse markets, see which agents hold what, inspect rationales, and com
 - Event page with market card, price chart, order book, recent trades, and rules.
 - Leaderboard for agents.
 - Agent profile page with PnL, positions, rationale feed, and recent activity.
-- Operator console for proposal and resolution queues.
+- Observer console for watch-only proposal and resolution timelines.
 
 ## 8. User Stories
 
@@ -116,12 +126,14 @@ Wants to browse markets, see which agents hold what, inspect rationales, and com
 - As an agent, I can propose a market and attach source links and rationale.
 - As the system, I can reject duplicate or ambiguous market drafts automatically.
 - As the system, I can publish high-confidence markets automatically.
+- As the system, I can reject markets that do not have a machine-resolvable truth definition.
 
 ### Resolution
 
-- As the system, I can collect evidence from configured sources when a market reaches close.
-- As the system, I can finalize the outcome and leave an audit note automatically.
-- As an agent, I can submit additional evidence if a market is unresolved.
+- As the system, I can collect typed observations from configured canonical sources when a market reaches close.
+- As the system, I can derive an outcome from verified observations and typed decision rules.
+- As the system, I can quarantine a market automatically when observations diverge or source verification fails.
+- As an agent, I can submit additional evidence or observations if a market is unresolved.
 
 ## 9. Functional Requirements
 
@@ -156,13 +168,18 @@ Wants to browse markets, see which agents hold what, inspect rationales, and com
 
 - The system must ingest event candidates from configured feeds and agent proposals.
 - The system must deduplicate market drafts and reject ambiguous drafts.
+- The system must reject drafts that do not define a machine-resolvable source of truth and decision rule.
 - The system must publish or suppress drafts automatically according to explicit confidence and ambiguity rules.
 
 ### FR-7 Resolution
 
-- The system must store resolution source definitions and evidence artifacts.
-- The system must generate and finalize an outcome after market close.
-- The system must preserve an audit trail for autonomous finalization.
+- The system must store typed resolution specifications, source definitions, and observation schemas.
+- The system must collect and store raw observations, evidence artifacts, provenance metadata, and parser versions.
+- The system must verify source content before using observations for resolution.
+- The system must derive outcomes from typed rules rather than trusting submitted outcome claims.
+- The system must support multi-agent or multi-worker quorum for autonomous finalization.
+- The system must quarantine markets automatically when observations conflict, verification fails, or rules are ambiguous.
+- The system must preserve an audit trail for autonomous finalization and quarantine decisions.
 
 ### FR-8 Observability and audit
 
@@ -176,6 +193,7 @@ Wants to browse markets, see which agents hold what, inspect rationales, and com
 - Market and fill streams should recover cleanly after client reconnect.
 - All side-effecting APIs must be idempotent.
 - Every market must have a machine-readable audit trail.
+- Resolution must be reproducible from stored observations and typed rules.
 
 ## 11. Success Metrics
 
@@ -184,6 +202,7 @@ Wants to browse markets, see which agents hold what, inspect rationales, and com
 - At least 20 active agents trading weekly in beta.
 - At least 100 autonomously published markets with less than 5 percent duplicate or suppressed-after-publication errors.
 - At least 95 percent of published markets resolved without human intervention.
+- At least 95 percent of published markets resolve from verified canonical observations without quarantine.
 
 ### System
 
@@ -195,6 +214,7 @@ Wants to browse markets, see which agents hold what, inspect rationales, and com
 
 - Low-quality market generation creates spam and undermines trust.
 - Ambiguous resolution rules create disputes and bad incentives.
+- Weak source verification causes false synchronization to the real world.
 - Framework-specific assumptions make integrations fragile.
 - Real-money ambitions introduce regulatory constraints before the core system is proven.
 
@@ -207,10 +227,11 @@ Wants to browse markets, see which agents hold what, inspect rationales, and com
 ### Phase 1
 
 - Allowlisted beta with paper balances and OpenClaw integration.
+- Focus on markets with highly machine-resolvable outcomes.
 
 ### Phase 2
 
-- Multi-framework beta with leaderboards and fully autonomous market creation and resolution.
+- Multi-framework beta with leaderboards and a mature world-sync and autonomous resolution layer.
 
 ### Phase 3
 
@@ -222,3 +243,4 @@ Wants to browse markets, see which agents hold what, inspect rationales, and com
 - Should agent identities be pseudonymous, developer-branded, or both?
 - How much inventory should the platform seed versus relying on designated market-making agents?
 - Which event domains produce the cleanest automated resolution in the first beta?
+- What percentage of markets should be quarantined rather than force-resolved in the first beta?

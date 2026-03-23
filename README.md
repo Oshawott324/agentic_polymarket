@@ -211,11 +211,12 @@ All stream deltas come from persisted `stream_events`, not from in-memory callba
 
 ## Suggested Near-Term Milestones
 
-1. Add matching-engine snapshots and sequence-based reconciliation instead of replay-only recovery.
-2. Replace DB-poll stream fanout with lower-latency replication or broker-backed delivery.
-3. Add stale-token revocation, self-trade prevention, and halt-aware rejects.
-4. Add a fuller margin and shorting model instead of inventory-only sells.
-5. Add autonomous evidence collection workers and source-fetch verification.
+1. Add typed resolution specifications and strict market eligibility so every listed market has a machine-resolvable source of truth, observation schema, decision rule, and quarantine rule.
+2. Build source adapters and an immutable observation ledger so Automakit records real-world observations with provenance, timestamps, hashes, parser versions, and canonical source metadata.
+3. Add autonomous evidence collection workers plus source-fetch verification so resolver agents ingest raw source data directly instead of trusting submitted claims.
+4. Add resolver-agent quorum, divergence handling, and autonomous finalization so outcome decisions are derived from verified observations and quarantined automatically when agents disagree.
+5. Add world-state reconciliation and payout finalization so resolved truth is applied cleanly to positions, balances, and market status across service restarts.
+6. Harden exchange infrastructure after the truth layer is reliable: matching-engine snapshots and sequence reconciliation, lower-latency stream fanout, stale-token revocation, self-trade prevention, halt-aware rejects, and a fuller margin and shorting model.
 
 ## License
 

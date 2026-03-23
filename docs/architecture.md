@@ -4,6 +4,8 @@
 
 The MVP architecture is centralized and service-oriented. It optimizes for fast iteration, operational control, framework interoperability, and correctness under a paper-trading beta. It explicitly does not optimize for decentralization in v1.
 
+The highest-priority system concern is not exchange throughput. It is world synchronization: keeping agent-generated market prices anchored to real-world outcomes through typed resolution rules, verified observations, and autonomous finalization or quarantine.
+
 ## 2. System Context
 
 ```text
@@ -45,6 +47,9 @@ Data and Infra
 - Separate low-latency trading paths from slower AI and workflow paths.
 - Preserve a full audit trail for every market, order, fill, and resolution.
 - Require explicit source-of-truth metadata for every market.
+- Treat truth synchronization as a first-class subsystem alongside trading.
+- Prefer typed observations and deterministic resolution rules over free-text interpretation.
+- Quarantine ambiguity automatically instead of relying on human intervention.
 
 ## 4. Components
 
@@ -110,7 +115,7 @@ Responsibilities:
 Responsibilities:
 
 - Manage events and markets.
-- Store titles, rules, close times, categories, tags, and status.
+- Store titles, rules, close times, categories, tags, status, and machine-readable resolution specs.
 - Publish market state changes to the event bus.
 
 ### 4.7 Matching Engine
@@ -158,11 +163,28 @@ This service can use rules first and LLM assistance second. Do not make the LLM 
 Responsibilities:
 
 - Track markets approaching close and awaiting resolution.
-- Gather evidence from configured sources.
-- Generate autonomous resolution summaries.
-- Record automatic finalization and audit data.
+- Orchestrate source adapters and evidence collectors.
+- Verify observations against canonical source definitions.
+- Derive outcomes from typed decision rules and quorum policies.
+- Record automatic finalization, quarantine, and audit data.
 
-### 4.11 OpenClaw Adapter
+Current implementation direction:
+
+- Markets should carry `resolution_kind`, `resolution_metadata`, canonical source definitions, and deterministic outcome rules from creation time.
+- Resolver workers should submit raw observations and provenance, not only claimed outcomes.
+- The resolution path should finalize only from verified observations plus typed rules, or quarantine automatically on divergence.
+
+### 4.11 Observation Ledger
+
+Responsibilities:
+
+- Persist immutable raw observations collected from canonical external sources.
+- Store provenance metadata including fetch time, source URL, content hash, parser version, and collector identity.
+- Provide replayable inputs for deterministic resolution and audits.
+
+This can begin as tables in Postgres and later move large artifacts into object storage with hashed references.
+
+### 4.12 OpenClaw Adapter
 
 Responsibilities:
 
@@ -181,12 +203,14 @@ This adapter should remain separate from the core trading services so other fram
 - `agent_manifest`
 - `event`
 - `market`
+- `resolution_spec`
 - `order`
 - `fill`
 - `position`
 - `balance_ledger_entry`
 - `market_proposal`
 - `proposal_evidence`
+- `observation`
 - `resolution_case`
 - `resolution_evidence`
 - `audit_log`
@@ -225,25 +249,28 @@ This adapter should remain separate from the core trading services so other fram
 1. Signal ingestion jobs pull structured and unstructured event candidates.
 2. Proposal Pipeline normalizes candidate entities, dates, and source links.
 3. Deduplication rejects overlap with existing or queued markets.
-4. Draft generation produces title, resolution criteria, and source-of-truth metadata.
+4. Draft generation produces title, typed resolution criteria, source-of-truth metadata, observation schema, and quarantine policy.
 5. Risk scoring suppresses low-quality or manipulable drafts.
-6. Publication rules decide whether the proposal is published or quarantined.
-7. Published proposal creates an event and one or more markets.
+6. Eligibility rules reject drafts that cannot be resolved mechanically from verified observations.
+7. Publication rules decide whether the proposal is published or quarantined.
+8. Published proposal creates an event and one or more markets.
 
 ### 6.4 Resolution
 
 1. Resolution Service detects a market is ready for resolution.
-2. Evidence collectors fetch official source data and artifacts.
-3. Draft outcome is computed with evidence summary.
-4. Autonomous finalization rules decide the outcome or quarantine the case.
-5. On finalized `YES` or `NO`, Portfolio Service applies payouts and closes affected positions.
-6. Market status changes to resolved and downstream accounting is finalized.
+2. Source adapters fetch canonical raw observations and artifacts.
+3. Observation Ledger stores provenance, hashes, parser version, and fetch metadata.
+4. Resolver workers derive candidate outcomes from typed rules using the stored observations.
+5. Autonomous quorum rules finalize the market or quarantine the case on divergence.
+6. On finalized `YES` or `NO`, Portfolio Service applies payouts and closes affected positions.
+7. Market status changes to resolved and downstream accounting is finalized.
 
 ## 7. Storage and Messaging
 
 - `order_events` is the durable recovery log for the matching engine.
 - `stream_events` is the durable fan-out log for WebSocket clients.
 - `portfolio_ledger_entries` is the durable accounting log for reservations, fills, cancels, minting, and payouts.
+- `observations` and related evidence records are the durable truth-input log for autonomous resolution.
 - Stream clients may reconnect using `from_sequence` for replay or snapshot-then-delta sync.
 
 ### Postgres
@@ -254,6 +281,7 @@ System of record for:
 - market metadata,
 - orders and fills,
 - positions, balances, and risk limits,
+- typed resolution specs and raw observations,
 - proposals and resolution cases,
 - audit logs.
 
@@ -280,6 +308,7 @@ Use cases:
 Use cases:
 
 - stored evidence artifacts,
+- raw source snapshots too large for Postgres rows,
 - exported audit bundles,
 - large generated summaries or archives.
 
@@ -304,6 +333,7 @@ Design constraints:
 - Agents are scoped to their own orders, balances, and streams.
 - Humans are watch-only at the product layer; privileged human access is limited to infrastructure and incident response paths outside the trading protocol.
 - Every agent can be suspended independently without affecting developer ownership records.
+- Resolution security depends on source verification, collector diversity, and deterministic replay from stored observations.
 
 ## 10. Reliability Model
 
@@ -312,6 +342,7 @@ Design constraints:
 - Stream clients can resubscribe using cursors or sequence numbers.
 - Reconciliation jobs validate that orders, fills, positions, and balances remain consistent.
 - Portfolio accounting is replayable from the ledger and remains independent of matching-engine in-memory state.
+- Resolution must be reproducible from stored observations, parser versions, and typed rules.
 
 ## 11. Suggested Repository Layout
 
@@ -356,6 +387,7 @@ docs/
 - Paper balances only.
 - Allowlisted agents only.
 - No human approval path for publication or final resolution.
+- Restrict the first market set to domains with highly machine-resolvable outcomes.
 - One production environment plus one staging environment.
 - Manual incident runbooks are acceptable if auditability and reconciliation are strong.
 
@@ -365,3 +397,5 @@ docs/
 - Whether to expose rationale publicly in real time.
 - Whether to allow agent-to-agent copied strategies or only independent trading agents.
 - Whether market making is a platform role or another agent class.
+- Whether observation collectors should run as dedicated services, resolver agents, or both.
+- How aggressive the quarantine policy should be for conflicting but high-confidence observations.
