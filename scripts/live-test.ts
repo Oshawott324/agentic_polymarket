@@ -161,110 +161,48 @@ async function main() {
   const feedPort = await reservePort();
   const collectorAlphaPort = await reservePort();
   const collectorBetaPort = await reservePort();
+  const worldInputPort = await reservePort();
+  const worldModelPort = await reservePort();
+  const proposalAgentPort = await reservePort();
   const databaseDirectory = await mkdtemp(path.join(os.tmpdir(), "automakit-live-test-"));
   const databaseUrl = `postgres://postgres:postgres@127.0.0.1:${databasePort}/postgres`;
   const repoRoot = process.cwd();
   const nextBin = path.join(repoRoot, "node_modules", ".pnpm", "node_modules", ".bin", "next");
   const pgliteServerBin = path.join(repoRoot, "node_modules", ".bin", "pglite-server");
   const resolvedCloseTime = new Date(Date.now() - 60_000).toISOString();
-  const signalPayload = {
+  const worldInputPricePayload = {
     items: [
       {
-        sourceId: "btc-price-jun-2026",
-        sourceType: "calendar",
-        category: "crypto",
-        headline: "Will BTC trade above $100k by June 30, 2026?",
-        closeTime: resolvedCloseTime,
-        resolutionCriteria:
-          "Resolve YES if BTC spot trades above 100,000 USD on or before the close time.",
-        resolutionSpec: {
+        source_id: "btc-threshold-jun-2026",
+        title: "BTC threshold candidate",
+        summary: "BTC threshold world signal",
+        effective_at: resolvedCloseTime,
+        payload: {
           kind: "price_threshold",
-          source: {
-            adapter: "http_json",
-            canonical_url: `http://127.0.0.1:${feedPort}/sources/btc`,
-            allowed_domains: ["127.0.0.1", "localhost"],
-          },
-          observation_schema: {
-            type: "object",
-            fields: {
-              price: {
-                type: "number",
-                path: "price",
-              },
-              observed_at: {
-                type: "string",
-                path: "observed_at",
-              },
-            },
-          },
-          decision_rule: {
-            kind: "price_threshold",
-            observation_field: "price",
-            operator: "gt",
-            threshold: 100000,
-          },
-          quorum_rule: {
-            min_observations: 2,
-            min_distinct_collectors: 2,
-            agreement: "all",
-          },
-          quarantine_rule: {
-            on_source_fetch_failure: true,
-            on_schema_validation_failure: true,
-            on_observation_conflict: true,
-            max_observation_age_seconds: 3600,
-          },
+          asset_symbol: "BTC",
+          threshold: 100000,
+          operator: "gt",
+          target_time: resolvedCloseTime,
+          canonical_source_url: `http://127.0.0.1:${feedPort}/sources/btc`,
+          category: "crypto",
         },
       },
+    ],
+  };
+  const worldInputFedPayload = {
+    items: [
       {
-        sourceId: "fed-cut-jul-2026",
-        sourceType: "calendar",
-        category: "macro",
-        headline: "Will the Fed cut rates before July 31, 2026?",
-        closeTime: resolvedCloseTime,
-        resolutionCriteria:
-          "Resolve YES if the federal funds target range is lowered before the close time.",
-        resolutionSpec: {
+        source_id: "fed-cut-jul-2026",
+        title: "Federal Reserve rate decision candidate",
+        summary: "Federal Reserve rate cut world signal",
+        effective_at: resolvedCloseTime,
+        payload: {
           kind: "rate_decision",
-          source: {
-            adapter: "http_json",
-            canonical_url: `http://127.0.0.1:${feedPort}/sources/fed`,
-            allowed_domains: ["127.0.0.1", "localhost"],
-          },
-          observation_schema: {
-            type: "object",
-            fields: {
-              previous_upper_bound_bps: {
-                type: "number",
-                path: "previous_upper_bound_bps",
-              },
-              current_upper_bound_bps: {
-                type: "number",
-                path: "current_upper_bound_bps",
-              },
-              observed_at: {
-                type: "string",
-                path: "observed_at",
-              },
-            },
-          },
-          decision_rule: {
-            kind: "rate_decision",
-            previous_field: "previous_upper_bound_bps",
-            current_field: "current_upper_bound_bps",
-            direction: "cut",
-          },
-          quorum_rule: {
-            min_observations: 2,
-            min_distinct_collectors: 2,
-            agreement: "all",
-          },
-          quarantine_rule: {
-            on_source_fetch_failure: true,
-            on_schema_validation_failure: true,
-            on_observation_conflict: true,
-            max_observation_age_seconds: 3600,
-          },
+          institution: "Federal Reserve",
+          direction: "cut",
+          target_time: resolvedCloseTime,
+          canonical_source_url: `http://127.0.0.1:${feedPort}/sources/fed`,
+          category: "macro",
         },
       },
     ],
@@ -273,9 +211,15 @@ async function main() {
   let fedObservationCount = 0;
 
   const feedServer = http.createServer((request, response) => {
-    if (request.url === "/signals") {
+    if (request.url === "/world-input/price") {
       response.writeHead(200, { "content-type": "application/json" });
-      response.end(JSON.stringify(signalPayload));
+      response.end(JSON.stringify(worldInputPricePayload));
+      return;
+    }
+
+    if (request.url === "/world-input/fed-calendar") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(worldInputFedPayload));
       return;
     }
 
@@ -388,15 +332,60 @@ async function main() {
     );
     processes.push(
       startProcess(
-        "market-creator",
+        "world-input",
         process.execPath,
         ["dist/index.js"],
         {
-          PROPOSAL_PIPELINE_URL: "http://127.0.0.1:4005",
-          MARKET_CREATOR_SIGNAL_FEED_URLS: `http://127.0.0.1:${feedPort}/signals`,
-          MARKET_CREATOR_INTERVAL_MS: "1000",
+          DATABASE_URL: databaseUrl,
+          WORLD_INPUT_SOURCES_JSON: JSON.stringify([
+            {
+              key: "btc-price",
+              adapter: "http_json_price",
+              url: `http://127.0.0.1:${feedPort}/world-input/price`,
+              poll_interval_seconds: 1,
+              backfill_hours: 24,
+              trust_tier: "exchange",
+            },
+            {
+              key: "fed-calendar",
+              adapter: "http_json_calendar",
+              url: `http://127.0.0.1:${feedPort}/world-input/fed-calendar`,
+              poll_interval_seconds: 1,
+              backfill_hours: 24,
+              trust_tier: "official",
+            },
+          ]),
+          WORLD_INPUT_PORT: String(worldInputPort),
+          WORLD_INPUT_INTERVAL_MS: "250",
         },
-        path.join(repoRoot, "services", "market-creator"),
+        path.join(repoRoot, "services", "world-input"),
+      ),
+    );
+    processes.push(
+      startProcess(
+        "world-model",
+        process.execPath,
+        ["dist/index.js"],
+        {
+          DATABASE_URL: databaseUrl,
+          WORLD_MODEL_PORT: String(worldModelPort),
+          WORLD_MODEL_INTERVAL_MS: "250",
+        },
+        path.join(repoRoot, "services", "world-model"),
+      ),
+    );
+    processes.push(
+      startProcess(
+        "proposal-agent",
+        process.execPath,
+        ["dist/index.js"],
+        {
+          DATABASE_URL: databaseUrl,
+          PROPOSAL_PIPELINE_URL: "http://127.0.0.1:4005",
+          PROPOSAL_AGENT_PORT: String(proposalAgentPort),
+          PROPOSAL_AGENT_INTERVAL_MS: "250",
+        },
+        path.join(repoRoot, "services", "proposal-agent"),
       ),
     );
     processes.push(
@@ -458,10 +447,27 @@ async function main() {
     await waitForJson("http://127.0.0.1:4004/health");
     await waitForJson("http://127.0.0.1:4005/health");
     await waitForJson("http://127.0.0.1:4006/health");
+    await waitForJson(`http://127.0.0.1:${worldInputPort}/health`);
+    await waitForJson(`http://127.0.0.1:${worldModelPort}/health`);
+    await waitForJson(`http://127.0.0.1:${proposalAgentPort}/health`);
     await waitForJson(`http://127.0.0.1:${collectorAlphaPort}/health`);
     await waitForJson(`http://127.0.0.1:${collectorBetaPort}/health`);
     await waitForText("http://127.0.0.1:3000", "Markets");
     await waitForText("http://127.0.0.1:3001/proposals", "Proposal Queue");
+
+    await waitForCondition("world signals", async () => {
+      const signals = (await waitForJson(`http://127.0.0.1:${worldInputPort}/v1/internal/world-signals`)) as {
+        items: Array<{ source_id: string }>;
+      };
+      return signals.items.length >= 2;
+    });
+
+    await waitForCondition("world hypotheses", async () => {
+      const hypotheses = (await waitForJson(`http://127.0.0.1:${worldModelPort}/v1/internal/world-hypotheses`)) as {
+        items: Array<{ status: string }>;
+      };
+      return hypotheses.items.length >= 2;
+    });
 
     await waitForCondition("published proposals", async () => {
       const proposals = (await waitForJson("http://127.0.0.1:4005/v1/proposals")) as {
@@ -485,12 +491,8 @@ async function main() {
       items: Array<{ id: string; title: string }>;
     };
 
-    const btcMarket = markets.items.find((entry) =>
-      entry.title.includes("BTC trade above $100k"),
-    );
-    const fedMarket = markets.items.find((entry) =>
-      entry.title.includes("Fed cut rates before July 31, 2026"),
-    );
+    const btcMarket = markets.items.find((entry) => entry.title.includes("BTC trade above"));
+    const fedMarket = markets.items.find((entry) => entry.title.includes("Federal Reserve cut rates"));
 
     if (!btcMarket || !fedMarket) {
       throw new Error(`Expected BTC and Fed markets, received ${JSON.stringify(markets.items)}`);
@@ -499,14 +501,14 @@ async function main() {
     const proposalTitles = proposals.items.map((proposal) => proposal.title).sort();
     if (
       proposalTitles.length < 2 ||
-      !proposalTitles.some((title) => title.includes("BTC trade above $100k")) ||
-      !proposalTitles.some((title) => title.includes("Fed cut rates before July 31, 2026"))
+      !proposalTitles.some((title) => title.includes("BTC trade above")) ||
+      !proposalTitles.some((title) => title.includes("Federal Reserve cut rates"))
     ) {
       throw new Error(`Unexpected proposal set: ${JSON.stringify(proposals.items)}`);
     }
 
-    await waitForText("http://127.0.0.1:3000", "Will BTC trade above $100k by June 30, 2026?");
-    await waitForText("http://127.0.0.1:3001/proposals", "Will the Fed cut rates before July 31, 2026?");
+    await waitForText("http://127.0.0.1:3000", "Will BTC trade above $100,000");
+    await waitForText("http://127.0.0.1:3001/proposals", "Will Federal Reserve cut rates");
 
     await waitForCondition("autonomous resolutions", async () => {
       const resolutions = (await waitForJson("http://127.0.0.1:4006/v1/resolutions")) as {
@@ -554,11 +556,13 @@ async function main() {
       );
     }
 
-    const marketCreator = processes.find((entry) => entry.name === "market-creator");
-    if (!marketCreator) {
-      throw new Error("market-creator process not found");
+    for (const process of ["proposal-agent", "world-model", "world-input"]) {
+      const service = processes.find((entry) => entry.name === process);
+      if (!service) {
+        throw new Error(`${process} process not found`);
+      }
+      await stopProcess(service);
     }
-    await stopProcess(marketCreator);
 
     const proposalPipeline = processes.find((entry) => entry.name === "proposal-pipeline");
     const marketService = processes.find((entry) => entry.name === "market-service");
@@ -624,8 +628,8 @@ async function main() {
       throw new Error(`Quarantined resolution was not persisted: ${JSON.stringify(persistedResolutions.items)}`);
     }
 
-    await waitForText("http://127.0.0.1:3000", "Will BTC trade above $100k by June 30, 2026?");
-    await waitForText("http://127.0.0.1:3001/proposals", "Will the Fed cut rates before July 31, 2026?");
+    await waitForText("http://127.0.0.1:3000", "Will BTC trade above $100,000");
+    await waitForText("http://127.0.0.1:3001/proposals", "Will Federal Reserve cut rates");
 
     console.log("live-test ok");
   } finally {

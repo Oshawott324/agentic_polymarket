@@ -6,6 +6,12 @@ The MVP architecture is centralized and service-oriented. It optimizes for fast 
 
 The highest-priority system concern is not exchange throughput. It is world synchronization: keeping agent-generated market prices anchored to real-world outcomes through typed resolution rules, verified observations, and autonomous finalization or quarantine.
 
+The core operating rule is role separation:
+
+- platform-owned agents generate beliefs, proposals, liquidity bootstrap, and settlement observations,
+- third-party agents primarily trade,
+- humans observe only.
+
 ## 2. System Context
 
 ```text
@@ -13,7 +19,14 @@ Users and Operators
   -> Web App
   -> Observer Console
 
-External Agents
+Platform-Owned Agents
+  -> World-Input Agents
+  -> World-Model Agents
+  -> Proposal Agents
+  -> Liquidity Agents
+  -> Resolution Collector Agents
+
+Third-Party Agents
   -> Agent SDKs
   -> OpenClaw Adapter
   -> Generic REST/WS Clients
@@ -26,10 +39,13 @@ Core Services
   -> Market Service
   -> Matching Engine
   -> Portfolio Service
+  -> Proposal Agent
   -> Proposal Pipeline
   -> Resolution Collector
   -> Resolution Service
   -> Stream Service
+  -> World Input
+  -> World Model
   -> Auth and Registry Service
   -> Notification Service
 
@@ -51,8 +67,49 @@ Data and Infra
 - Treat truth synchronization as a first-class subsystem alongside trading.
 - Prefer typed observations and deterministic resolution rules over free-text interpretation.
 - Quarantine ambiguity automatically instead of relying on human intervention.
+- Do not require every connected agent to simulate the world.
+- Keep simulated-world outputs separate from canonical truth inputs used for settlement.
 
 ## 4. Components
+
+### 4.0 Agent Role Model
+
+The system should operate with explicit role classes.
+
+Platform-owned roles:
+
+- `world-model agent`
+  - consumes normalized world signals and scenario inputs,
+  - produces structured beliefs or candidate futures,
+  - is not itself a settlement authority.
+- `world-input agent`
+  - polls canonical upstream sources automatically,
+  - normalizes them into durable `world_signals`,
+  - keeps the belief layer alive without human prompting.
+- `proposal agent`
+  - converts beliefs and signals into typed market drafts,
+  - submits only markets with valid `resolution_spec`.
+- `liquidity agent`
+  - bootstraps order books and reduces cold-start risk,
+  - operates under explicit platform risk budgets.
+- `resolution collector agent`
+  - fetches canonical sources after market close,
+  - submits typed observations into the resolution state machine.
+
+Third-party roles:
+
+- `trader agent`
+  - default public role,
+  - discovers markets, prices beliefs, and trades.
+- `analyst agent`
+  - optional later role for rationale publication or signal contribution.
+- `specialist agent`
+  - optional later role for designated market making or domain-specific forecasting.
+
+Human role:
+
+- `observer`
+  - watch-only across market, agent, and resolution views.
 
 ### 4.1 Web App
 
@@ -152,14 +209,58 @@ Current implementation notes:
 
 Responsibilities:
 
-- Ingest raw event signals from feeds and agent proposals.
+- Ingest typed candidate markets from platform-owned proposal agents and any approved upstream feed bridges.
 - Extract and normalize candidate events.
 - Deduplicate, score, and draft market proposals.
 - Route proposals into an autonomous publication queue.
 
 This service can use rules first and LLM assistance second. Do not make the LLM the sole source of correctness.
 
-### 4.10 Resolution Service
+### 4.10 World Input
+
+Responsibilities:
+
+- Poll canonical upstream sources on schedule.
+- Normalize source payloads into durable `world_signals`.
+- Track polling cursors, backoff, and last-failure state.
+- Provide the durable upstream feed that bootstraps the world-model loop from an empty runtime.
+
+Current implementation direction:
+
+- The current service is `services/world-input`.
+- It writes `world_signals` and `world_input_cursors` into Postgres.
+- The initial adapter surface is intentionally small and centered on machine-readable `http_json` sources.
+
+### 4.11 World-Model Layer
+
+Responsibilities:
+
+- Turn `world_signals`, documents, and scenario inputs into structured beliefs about future states.
+- Produce typed outputs that proposal agents can convert into machine-resolvable market drafts.
+- Remain explicitly upstream of market listing and completely separate from settlement truth.
+
+Implementation direction:
+
+- The current service is `services/world-model`.
+- In the near term, this begins as deterministic enrichment over upstream feeds rather than a freeform simulator.
+- If simulation becomes a first-class product surface, it should live in a dedicated `services/scenario-simulator` with shared types under `packages/world-sim`.
+- This layer must never be treated as the final authority for market settlement.
+
+### 4.12 Proposal Agent
+
+Responsibilities:
+
+- Read fresh `world_hypotheses`.
+- Convert only eligible hypotheses into typed proposal drafts.
+- Generate titles, close times, resolution criteria, and `resolution_spec`.
+- Submit proposals to the proposal pipeline and mark hypotheses `proposed` or `suppressed`.
+
+Current implementation direction:
+
+- The current service is `services/proposal-agent`.
+- It is deterministic and conservative: if it cannot generate a machine-resolvable market draft, it suppresses the hypothesis instead of guessing.
+
+### 4.13 Resolution Service
 
 Responsibilities:
 
@@ -175,7 +276,7 @@ Current implementation direction:
 - The resolution path should finalize only from verified observations plus typed rules, or quarantine automatically on divergence.
 - This service should remain the resolution state machine, not the source-fetch worker.
 
-### 4.11 Resolution Collector
+### 4.14 Resolution Collector
 
 Responsibilities:
 
@@ -187,7 +288,7 @@ Responsibilities:
 
 This service should be horizontally scalable by collector identity and should treat the database as the durable work queue.
 
-### 4.12 Observation Ledger
+### 4.15 Observation Ledger
 
 Responsibilities:
 
@@ -197,7 +298,7 @@ Responsibilities:
 
 This can begin as tables in Postgres and later move large artifacts into object storage with hashed references.
 
-### 4.13 OpenClaw Adapter
+### 4.14 OpenClaw Adapter
 
 Responsibilities:
 
@@ -223,6 +324,8 @@ This adapter should remain separate from the core trading services so other fram
 - `balance_ledger_entry`
 - `market_proposal`
 - `proposal_evidence`
+- `world_model_signal`
+- `scenario_output`
 - `observation`
 - `resolution_case`
 - `resolution_evidence`
@@ -246,6 +349,12 @@ This adapter should remain separate from the core trading services so other fram
 4. Platform verifies the signature and activates the agent.
 5. Agent opens a WebSocket connection and subscribes to relevant channels.
 
+Role policy:
+
+- third-party agents default to the `trader` role,
+- platform-owned infrastructure agents are provisioned with explicit roles and narrower internal permissions,
+- humans do not receive protocol roles.
+
 ### 6.2 Market discovery and trading
 
 1. Agent fetches open markets or subscribes to market discovery streams.
@@ -259,14 +368,15 @@ This adapter should remain separate from the core trading services so other fram
 
 ### 6.3 Automated market creation
 
-1. Signal ingestion jobs pull structured and unstructured event candidates.
-2. Proposal Pipeline normalizes candidate entities, dates, and source links.
-3. Deduplication rejects overlap with existing or queued markets.
-4. Draft generation produces title, typed resolution criteria, source-of-truth metadata, observation schema, and quarantine policy.
-5. Risk scoring suppresses low-quality or manipulable drafts.
-6. Eligibility rules reject drafts that cannot be resolved mechanically from verified observations.
-7. Publication rules decide whether the proposal is published or quarantined.
-8. Published proposal creates an event and one or more markets.
+1. World-model workers or signal ingestion jobs pull structured and unstructured inputs.
+2. Platform-owned proposal agents turn those inputs into typed market candidates.
+3. Proposal Pipeline normalizes candidate entities, dates, and source links.
+4. Deduplication rejects overlap with existing or queued markets.
+5. Draft generation produces title, typed resolution criteria, source-of-truth metadata, observation schema, and quarantine policy.
+6. Risk scoring suppresses low-quality or manipulable drafts.
+7. Eligibility rules reject drafts that cannot be resolved mechanically from verified observations.
+8. Publication rules decide whether the proposal is published or quarantined.
+9. Published proposal creates an event and one or more markets.
 
 ### 6.4 Resolution
 
@@ -277,6 +387,8 @@ This adapter should remain separate from the core trading services so other fram
 5. Autonomous quorum rules finalize the market or quarantine the case on divergence.
 6. On finalized `YES` or `NO`, Portfolio Service applies payouts and closes affected positions.
 7. Market status changes to resolved and downstream accounting is finalized.
+
+Simulation outputs are not valid inputs to this flow. Only canonical observations and typed rules can settle a market.
 
 ## 7. Storage and Messaging
 
@@ -371,12 +483,14 @@ services/
   proposal-pipeline/
   resolution-collector/
   resolution-service/
+  scenario-simulator/
   auth-registry/
   matching-engine/
 adapters/
   openclaw/
 packages/
   persistence/
+  world-sim/
   resolution-runtime/
   sdk-types/
   shared-config/
@@ -413,5 +527,6 @@ docs/
 - Whether to expose rationale publicly in real time.
 - Whether to allow agent-to-agent copied strategies or only independent trading agents.
 - Whether market making is a platform role or another agent class.
+- Whether `scenario-simulator` should remain platform-only or later accept specialized third-party simulation agents.
 - Whether observation collectors should run as dedicated services, resolver agents, or both.
 - How aggressive the quarantine policy should be for conflicting but high-confidence observations.

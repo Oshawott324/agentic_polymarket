@@ -65,6 +65,67 @@ export async function ensureCoreSchema(pool: Pool) {
       created_at TIMESTAMPTZ NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS world_signals (
+      id TEXT PRIMARY KEY,
+      source_type TEXT NOT NULL,
+      source_adapter TEXT NOT NULL,
+      source_id TEXT NOT NULL,
+      source_url TEXT NOT NULL,
+      trust_tier TEXT NOT NULL,
+      title TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      payload JSONB NOT NULL,
+      entity_refs JSONB NOT NULL,
+      dedupe_key TEXT NOT NULL UNIQUE,
+      fetched_at TIMESTAMPTZ NOT NULL,
+      effective_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_world_signals_source_type_fetched
+      ON world_signals (source_type, fetched_at DESC);
+
+    CREATE INDEX IF NOT EXISTS idx_world_signals_created
+      ON world_signals (created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS world_input_cursors (
+      source_key TEXT PRIMARY KEY,
+      cursor_value TEXT,
+      last_polled_at TIMESTAMPTZ,
+      next_poll_at TIMESTAMPTZ NOT NULL,
+      backoff_until TIMESTAMPTZ,
+      failure_count INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      updated_at TIMESTAMPTZ NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS world_hypotheses (
+      id TEXT PRIMARY KEY,
+      source_signal_ids JSONB NOT NULL,
+      category TEXT NOT NULL,
+      subject TEXT NOT NULL,
+      predicate TEXT NOT NULL,
+      target_time TIMESTAMPTZ NOT NULL,
+      confidence_score DOUBLE PRECISION NOT NULL,
+      reasoning_summary TEXT NOT NULL,
+      machine_resolvable BOOLEAN NOT NULL,
+      suggested_resolution_kind TEXT,
+      suggested_resolution_source_url TEXT,
+      suggested_resolution_metadata JSONB,
+      dedupe_key TEXT NOT NULL UNIQUE,
+      status TEXT NOT NULL,
+      suppression_reason TEXT,
+      linked_proposal_id TEXT,
+      created_at TIMESTAMPTZ NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_world_hypotheses_status_created
+      ON world_hypotheses (status, created_at DESC);
+
+    CREATE INDEX IF NOT EXISTS idx_world_hypotheses_category_target_time
+      ON world_hypotheses (category, target_time DESC);
+
     CREATE TABLE IF NOT EXISTS markets (
       id TEXT PRIMARY KEY,
       proposal_id TEXT NOT NULL UNIQUE,

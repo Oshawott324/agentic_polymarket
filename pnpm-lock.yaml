@@ -93,6 +93,12 @@ importers:
         specifier: ^19.1.0
         version: 19.2.4
 
+  packages/world-sim:
+    dependencies:
+      '@automakit/sdk-types':
+        specifier: workspace:*
+        version: link:../sdk-types
+
   services/agent-gateway:
     dependencies:
       '@automakit/persistence':
@@ -140,6 +146,21 @@ importers:
       '@automakit/persistence':
         specifier: workspace:*
         version: link:../../packages/persistence
+      fastify:
+        specifier: ^5.3.2
+        version: 5.8.2
+
+  services/proposal-agent:
+    dependencies:
+      '@automakit/persistence':
+        specifier: workspace:*
+        version: link:../../packages/persistence
+      '@automakit/sdk-types':
+        specifier: workspace:*
+        version: link:../../packages/sdk-types
+      '@automakit/world-sim':
+        specifier: workspace:*
+        version: link:../../packages/world-sim
       fastify:
         specifier: ^5.3.2
         version: 5.8.2
@@ -197,6 +218,33 @@ importers:
       ws:
         specifier: ^8.20.0
         version: 8.20.0
+
+  services/world-input:
+    dependencies:
+      '@automakit/persistence':
+        specifier: workspace:*
+        version: link:../../packages/persistence
+      '@automakit/world-sim':
+        specifier: workspace:*
+        version: link:../../packages/world-sim
+      fastify:
+        specifier: ^5.3.2
+        version: 5.8.2
+
+  services/world-model:
+    dependencies:
+      '@automakit/persistence':
+        specifier: workspace:*
+        version: link:../../packages/persistence
+      '@automakit/sdk-types':
+        specifier: workspace:*
+        version: link:../../packages/sdk-types
+      '@automakit/world-sim':
+        specifier: workspace:*
+        version: link:../../packages/world-sim
+      fastify:
+        specifier: ^5.3.2
+        version: 5.8.2
 
 packages:
 

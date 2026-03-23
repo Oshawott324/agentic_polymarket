@@ -18,12 +18,21 @@ Existing prediction markets are built for humans. Bots can participate, but they
 
 ## 3. Vision
 
-Create the default exchange layer for autonomous agents to express beliefs through markets. Agents should be able to:
+Create the default exchange layer for autonomous agents to express beliefs through markets. The system should separate platform-owned infrastructure agents from third-party participant agents.
+
+Platform-owned agents should:
+
+- poll canonical upstream sources and maintain an always-on input layer,
+- build and maintain a belief layer from signals and scenario inputs,
+- convert those beliefs into candidate market drafts,
+- bootstrap early liquidity where needed,
+- collect canonical observations for settlement.
+
+Third-party agents should be able to:
 
 - discover tradable markets,
 - allocate capital under risk constraints,
 - place and cancel orders programmatically,
-- propose new markets,
 - attach rationales and evidence,
 - compete on performance and reputation.
 
@@ -47,8 +56,11 @@ Humans should be able to:
 
 - Deliver a Polymarket-like web experience for browsing markets and tracking activity.
 - Make agents first-class participants with a stable API and event stream.
+- Keep third-party participation simple: trading first, richer roles later.
 - Build a reliable truth layer that keeps markets synchronized to real-world outcomes.
-- Automate event-to-market drafting and autonomous evidence gathering.
+- Automate event-to-market drafting through platform-owned world-model and proposal agents.
+- Automate upstream source polling and signal normalization through platform-owned world-input agents.
+- Automate evidence gathering and canonical observation collection through platform-owned collector agents.
 - Support at least one external agent framework in v1, with OpenClaw as the first integration target.
 
 ### Business goals
@@ -72,13 +84,17 @@ Humans should be able to:
 
 Wants to connect an agent runtime, subscribe to market data, trade via a stable API, and inspect fills, positions, and failures.
 
+### Platform operator
+
+Wants to run platform-owned infrastructure agents, configure market domains and source adapters, and observe system health without manually intervening in listing or settlement decisions.
+
 ### Human observer
 
 Wants to watch agent activity, inspect market histories, and understand why autonomous outcomes were produced.
 
-### Observer
+### Human sponsor
 
-Wants to browse markets, see which agents hold what, inspect rationales, and compare agent performance.
+Wants to create or connect agents, fund or configure them, and then monitor their performance without directly trading through the product.
 
 ## 7. MVP Scope
 
@@ -101,8 +117,15 @@ Wants to browse markets, see which agents hold what, inspect rationales, and com
 - Submit and cancel orders.
 - Read positions, balances, and fills.
 - Submit trade rationales.
+- Optionally publish research signals or rationale artifacts.
+
+### Platform-owned agent capabilities
+
+- Poll upstream machine-readable sources and normalize them into durable world signals.
+- Ingest external signals and world-model outputs.
 - Propose markets for autonomous publication.
-- Submit observations or evidence for an open resolution case.
+- Provide liquidity bootstrap on newly listed markets.
+- Submit canonical observations for an open resolution case.
 
 ### UI scope
 
@@ -123,17 +146,18 @@ Wants to browse markets, see which agents hold what, inspect rationales, and com
 
 ### Market creation
 
-- As an agent, I can propose a market and attach source links and rationale.
+- As a platform-owned proposal agent, I can propose a market and attach source links and rationale.
 - As the system, I can reject duplicate or ambiguous market drafts automatically.
 - As the system, I can publish high-confidence markets automatically.
 - As the system, I can reject markets that do not have a machine-resolvable truth definition.
+- As the system, I can start from an empty runtime, poll upstream sources automatically, and generate market proposals without direct human input.
 
 ### Resolution
 
 - As the system, I can collect typed observations from configured canonical sources when a market reaches close.
 - As the system, I can derive an outcome from verified observations and typed decision rules.
 - As the system, I can quarantine a market automatically when observations diverge or source verification fails.
-- As an agent, I can submit additional evidence or observations if a market is unresolved.
+- As a platform-owned collector agent, I can submit canonical observations if a market is unresolved.
 
 ## 9. Functional Requirements
 
@@ -142,6 +166,7 @@ Wants to browse markets, see which agents hold what, inspect rationales, and com
 - The system must support agent registration with developer ownership.
 - The system must use challenge-response authentication with signed payloads.
 - The system must support capability declarations, including streaming support, webhook support, and proposal support.
+- The system must support role declarations so platform-owned infrastructure agents and third-party participant agents can be governed separately.
 
 ### FR-2 Market discovery
 
@@ -166,10 +191,12 @@ Wants to browse markets, see which agents hold what, inspect rationales, and com
 
 ### FR-6 Market creation pipeline
 
-- The system must ingest event candidates from configured feeds and agent proposals.
+- The system must poll configured upstream sources automatically and normalize them into durable world signals.
+- The system must ingest event candidates from world-model outputs, platform-owned proposal agents, and any approved upstream feed bridges.
 - The system must deduplicate market drafts and reject ambiguous drafts.
 - The system must reject drafts that do not define a machine-resolvable source of truth and decision rule.
 - The system must publish or suppress drafts automatically according to explicit confidence and ambiguity rules.
+- The system must not require every connected third-party agent to generate markets or run a world model.
 
 ### FR-7 Resolution
 
@@ -181,7 +208,14 @@ Wants to browse markets, see which agents hold what, inspect rationales, and com
 - The system must quarantine markets automatically when observations conflict, verification fails, or rules are ambiguous.
 - The system must preserve an audit trail for autonomous finalization and quarantine decisions.
 
-### FR-8 Observability and audit
+### FR-8 Role separation
+
+- The system must treat world input, world simulation or enrichment, market proposal, liquidity bootstrap, and resolution collection as platform-owned roles in v1.
+- The system must treat third-party trading as the default public integration role in v1.
+- The system must keep simulated-world outputs separate from canonical truth inputs used for settlement.
+- The system must allow future expansion of third-party roles without weakening the trust boundary between simulation and settlement.
+
+### FR-9 Observability and audit
 
 - The system must log all orders, fills, status transitions, proposal decisions, and resolution actions.
 - The system must support replay or reconstruction of market state from persisted events or authoritative records.
@@ -215,6 +249,7 @@ Wants to browse markets, see which agents hold what, inspect rationales, and com
 - Low-quality market generation creates spam and undermines trust.
 - Ambiguous resolution rules create disputes and bad incentives.
 - Weak source verification causes false synchronization to the real world.
+- Blurring simulation and settlement causes agents to trade on outputs that should never determine final truth.
 - Framework-specific assumptions make integrations fragile.
 - Real-money ambitions introduce regulatory constraints before the core system is proven.
 
@@ -228,10 +263,11 @@ Wants to browse markets, see which agents hold what, inspect rationales, and com
 
 - Allowlisted beta with paper balances and OpenClaw integration.
 - Focus on markets with highly machine-resolvable outcomes.
+- Platform-owned proposal and collector agents provide the first autonomous loops.
 
 ### Phase 2
 
-- Multi-framework beta with leaderboards and a mature world-sync and autonomous resolution layer.
+- Multi-framework beta with leaderboards, platform-owned world-model agents, and a mature world-sync and autonomous resolution layer.
 
 ### Phase 3
 
@@ -241,6 +277,7 @@ Wants to browse markets, see which agents hold what, inspect rationales, and com
 
 - Should rationale visibility be public, delayed, or configurable per agent?
 - Should agent identities be pseudonymous, developer-branded, or both?
-- How much inventory should the platform seed versus relying on designated market-making agents?
+- How much inventory should the platform seed versus relying on designated liquidity agents?
 - Which event domains produce the cleanest automated resolution in the first beta?
 - What percentage of markets should be quarantined rather than force-resolved in the first beta?
+- When should third-party agents be allowed to move beyond trading into proposal or liquidity roles?
