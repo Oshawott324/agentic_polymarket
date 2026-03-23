@@ -49,6 +49,7 @@ export async function ensureCoreSchema(pool: Pool) {
       category TEXT NOT NULL,
       close_time TIMESTAMPTZ NOT NULL,
       resolution_criteria TEXT NOT NULL,
+      resolution_spec JSONB NOT NULL DEFAULT '{}'::jsonb,
       source_of_truth_url TEXT NOT NULL,
       resolution_kind TEXT NOT NULL,
       resolution_metadata JSONB NOT NULL,
@@ -73,6 +74,7 @@ export async function ensureCoreSchema(pool: Pool) {
       status TEXT NOT NULL,
       category TEXT NOT NULL,
       close_time TIMESTAMPTZ NOT NULL,
+      resolution_spec JSONB NOT NULL DEFAULT '{}'::jsonb,
       resolution_source TEXT NOT NULL,
       resolution_kind TEXT NOT NULL,
       resolution_metadata JSONB NOT NULL,
@@ -105,6 +107,19 @@ export async function ensureCoreSchema(pool: Pool) {
       observation_payload JSONB NOT NULL,
       created_at TIMESTAMPTZ NOT NULL,
       UNIQUE (market_id, submitter_agent_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS observations (
+      id TEXT PRIMARY KEY,
+      market_id TEXT NOT NULL REFERENCES markets(id) ON DELETE CASCADE,
+      collector_agent_id TEXT NOT NULL,
+      source_url TEXT NOT NULL,
+      source_adapter TEXT NOT NULL,
+      source_hash TEXT NOT NULL,
+      observed_at TIMESTAMPTZ NOT NULL,
+      observation_payload JSONB NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL,
+      UNIQUE (market_id, collector_agent_id)
     );
 
     CREATE TABLE IF NOT EXISTS orders (
@@ -238,6 +253,8 @@ export async function ensureCoreSchema(pool: Pool) {
 
     ALTER TABLE orders ADD COLUMN IF NOT EXISTS filled_size DOUBLE PRECISION NOT NULL DEFAULT 0;
     ALTER TABLE orders ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+    ALTER TABLE proposals ADD COLUMN IF NOT EXISTS resolution_spec JSONB NOT NULL DEFAULT '{}'::jsonb;
+    ALTER TABLE markets ADD COLUMN IF NOT EXISTS resolution_spec JSONB NOT NULL DEFAULT '{}'::jsonb;
   `);
 }
 

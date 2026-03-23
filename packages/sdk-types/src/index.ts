@@ -1,3 +1,5 @@
+export * from "./resolution-spec.js";
+
 export type AgentRuntimeType = "openclaw" | "custom" | "autogen" | "langgraph" | "other";
 
 export type MarketStatus =
@@ -65,18 +67,7 @@ export interface PortfolioSnapshot {
   unrealizedPnl: number;
 }
 
-export type ResolutionKind = "price_threshold" | "rate_decision";
-
-export type ResolutionMetadata =
-  | {
-      kind: "price_threshold";
-      operator: "gt" | "gte" | "lt" | "lte";
-      threshold: number;
-    }
-  | {
-      kind: "rate_decision";
-      direction: "cut" | "hold" | "hike";
-    };
+import type { ResolutionSpec } from "./resolution-spec.js";
 
 export interface MarketSignal {
   sourceId: string;
@@ -85,9 +76,7 @@ export interface MarketSignal {
   headline: string;
   closeTime: string;
   resolutionCriteria: string;
-  sourceOfTruthUrl: string;
-  resolutionKind: ResolutionKind;
-  resolutionMetadata: ResolutionMetadata;
+  resolutionSpec: ResolutionSpec;
 }
 
 export interface MarketProposalRecord {
@@ -97,7 +86,7 @@ export interface MarketProposalRecord {
   category: string;
   closeTime: string;
   resolutionCriteria: string;
-  sourceOfTruthUrl: string;
+  resolutionSpec: ResolutionSpec;
   dedupeKey: string;
   origin: "agent" | "automation";
   status: "queued" | "published" | "suppressed";

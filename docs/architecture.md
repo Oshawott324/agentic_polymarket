@@ -170,7 +170,7 @@ Responsibilities:
 
 Current implementation direction:
 
-- Markets should carry `resolution_kind`, `resolution_metadata`, canonical source definitions, and deterministic outcome rules from creation time.
+- Markets should carry a full `resolution_spec` with canonical source definitions, typed observation schemas, deterministic decision rules, quorum rules, and quarantine rules from creation time.
 - Resolver workers should submit raw observations and provenance, not only claimed outcomes.
 - The resolution path should finalize only from verified observations plus typed rules, or quarantine automatically on divergence.
 

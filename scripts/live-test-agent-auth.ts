@@ -289,12 +289,43 @@ async function main() {
         category: "crypto",
         close_time: "2026-12-31T23:59:59Z",
         resolution_criteria: "Resolve YES if BTC closes above 120,000 USD by the close time.",
-        source_of_truth_url: "https://www.cmegroup.com/",
-        resolution_kind: "price_threshold",
-        resolution_metadata: {
+        resolution_spec: {
           kind: "price_threshold",
-          operator: "gt",
-          threshold: 120000,
+          source: {
+            adapter: "http_json",
+            canonical_url: "http://127.0.0.1:4999/sources/btc",
+            allowed_domains: ["127.0.0.1", "localhost"],
+          },
+          observation_schema: {
+            type: "object",
+            fields: {
+              price: {
+                type: "number",
+                path: "price",
+              },
+              observed_at: {
+                type: "string",
+                path: "observed_at",
+              },
+            },
+          },
+          decision_rule: {
+            kind: "price_threshold",
+            observation_field: "price",
+            operator: "gt",
+            threshold: 120000,
+          },
+          quorum_rule: {
+            min_observations: 2,
+            min_distinct_collectors: 2,
+            agreement: "all",
+          },
+          quarantine_rule: {
+            on_source_fetch_failure: true,
+            on_schema_validation_failure: true,
+            on_observation_conflict: true,
+            max_observation_age_seconds: 3600,
+          },
         },
       }),
     });

@@ -174,12 +174,43 @@ async function main() {
         closeTime: "2026-06-30T23:59:59Z",
         resolutionCriteria:
           "Resolve YES if BTC spot trades above 100,000 USD on or before the close time.",
-        sourceOfTruthUrl: "https://www.cmegroup.com/",
-        resolutionKind: "price_threshold",
-        resolutionMetadata: {
+        resolutionSpec: {
           kind: "price_threshold",
-          operator: "gt",
-          threshold: 100000,
+          source: {
+            adapter: "http_json",
+            canonical_url: `http://127.0.0.1:${feedPort}/sources/btc`,
+            allowed_domains: ["127.0.0.1", "localhost"],
+          },
+          observation_schema: {
+            type: "object",
+            fields: {
+              price: {
+                type: "number",
+                path: "price",
+              },
+              observed_at: {
+                type: "string",
+                path: "observed_at",
+              },
+            },
+          },
+          decision_rule: {
+            kind: "price_threshold",
+            observation_field: "price",
+            operator: "gt",
+            threshold: 100000,
+          },
+          quorum_rule: {
+            min_observations: 2,
+            min_distinct_collectors: 2,
+            agreement: "all",
+          },
+          quarantine_rule: {
+            on_source_fetch_failure: true,
+            on_schema_validation_failure: true,
+            on_observation_conflict: true,
+            max_observation_age_seconds: 3600,
+          },
         },
       },
       {
@@ -190,20 +221,90 @@ async function main() {
         closeTime: "2026-07-31T23:59:59Z",
         resolutionCriteria:
           "Resolve YES if the federal funds target range is lowered before the close time.",
-        sourceOfTruthUrl: "https://www.federalreserve.gov/",
-        resolutionKind: "rate_decision",
-        resolutionMetadata: {
+        resolutionSpec: {
           kind: "rate_decision",
-          direction: "cut",
+          source: {
+            adapter: "http_json",
+            canonical_url: `http://127.0.0.1:${feedPort}/sources/fed`,
+            allowed_domains: ["127.0.0.1", "localhost"],
+          },
+          observation_schema: {
+            type: "object",
+            fields: {
+              previous_upper_bound_bps: {
+                type: "number",
+                path: "previous_upper_bound_bps",
+              },
+              current_upper_bound_bps: {
+                type: "number",
+                path: "current_upper_bound_bps",
+              },
+              observed_at: {
+                type: "string",
+                path: "observed_at",
+              },
+            },
+          },
+          decision_rule: {
+            kind: "rate_decision",
+            previous_field: "previous_upper_bound_bps",
+            current_field: "current_upper_bound_bps",
+            direction: "cut",
+          },
+          quorum_rule: {
+            min_observations: 2,
+            min_distinct_collectors: 2,
+            agreement: "all",
+          },
+          quarantine_rule: {
+            on_source_fetch_failure: true,
+            on_schema_validation_failure: true,
+            on_observation_conflict: true,
+            max_observation_age_seconds: 3600,
+          },
         },
       },
     ],
   };
 
+  let fedObservationCount = 0;
+
   const feedServer = http.createServer((request, response) => {
     if (request.url === "/signals") {
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify(signalPayload));
+      return;
+    }
+
+    if (request.url === "/sources/btc") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(
+        JSON.stringify({
+          price: 100500,
+          observed_at: new Date().toISOString(),
+        }),
+      );
+      return;
+    }
+
+    if (request.url === "/sources/fed") {
+      fedObservationCount += 1;
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(
+        JSON.stringify(
+          fedObservationCount === 1
+            ? {
+                previous_upper_bound_bps: 450,
+                current_upper_bound_bps: 425,
+                observed_at: new Date().toISOString(),
+              }
+            : {
+                previous_upper_bound_bps: 450,
+                current_upper_bound_bps: 450,
+                observed_at: new Date().toISOString(),
+              },
+        ),
+      );
       return;
     }
 
@@ -371,7 +472,7 @@ async function main() {
     await waitForText("http://127.0.0.1:3001/proposals", "Will the Fed cut rates before July 31, 2026?");
 
     for (const agentId of ["resolver-alpha", "resolver-beta"]) {
-      const evidenceResponse = await fetch("http://127.0.0.1:4006/v1/resolution-evidence", {
+      const evidenceResponse = await fetch("http://127.0.0.1:4006/v1/resolution-collect", {
         method: "POST",
         headers: {
           "content-type": "application/json",
@@ -379,59 +480,28 @@ async function main() {
         },
         body: JSON.stringify({
           market_id: btcMarket.id,
-          evidence_type: "url",
-          summary: "Outcome YES confirmed from official source.",
-          source_url: "https://www.cmegroup.com/markets/cryptocurrencies/bitcoin.html",
-          observed_at: "2026-06-30T20:00:00Z",
-          observation_payload: {
-            price: 100500,
-          },
         }),
       });
 
       if (!evidenceResponse.ok) {
-        throw new Error(`Resolution evidence submission failed with ${evidenceResponse.status}`);
+        throw new Error(`Resolution collection failed with ${evidenceResponse.status}`);
       }
     }
 
-    const conflictingEvidence = [
-      {
-        agentId: "resolver-gamma",
-        summary: "Outcome YES according to official rate decision source.",
-        observation_payload: {
-          previous_upper_bound_bps: 450,
-          current_upper_bound_bps: 425,
-        },
-      },
-      {
-        agentId: "resolver-delta",
-        summary: "Outcome NO according to official rate decision source.",
-        observation_payload: {
-          previous_upper_bound_bps: 450,
-          current_upper_bound_bps: 450,
-        },
-      },
-    ];
-
-    for (const entry of conflictingEvidence) {
-      const evidenceResponse = await fetch("http://127.0.0.1:4006/v1/resolution-evidence", {
+    for (const agentId of ["resolver-gamma", "resolver-delta"]) {
+      const evidenceResponse = await fetch("http://127.0.0.1:4006/v1/resolution-collect", {
         method: "POST",
         headers: {
           "content-type": "application/json",
-          "x-agent-id": entry.agentId,
+          "x-agent-id": agentId,
         },
         body: JSON.stringify({
           market_id: fedMarket.id,
-          evidence_type: "url",
-          summary: entry.summary,
-          source_url: "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm",
-          observed_at: "2026-07-31T19:00:00Z",
-          observation_payload: entry.observation_payload,
         }),
       });
 
       if (!evidenceResponse.ok) {
-        throw new Error(`Conflicting evidence submission failed with ${evidenceResponse.status}`);
+        throw new Error(`Conflicting resolution collection failed with ${evidenceResponse.status}`);
       }
     }
 

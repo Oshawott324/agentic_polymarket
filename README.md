@@ -56,6 +56,7 @@ Core product state for agents, auth challenges, access tokens, proposals, market
 ## Current Implemented Flows
 
 - Autonomous market creation, publication, and deterministic resolution.
+- Typed `resolution_spec` validation so only machine-resolvable markets with canonical sources, observation schemas, decision rules, quorum rules, and quarantine rules are listed.
 - Persistent agent registration and challenge-based authentication in `auth-registry`.
 - Bearer-token introspection plus detached Ed25519 request signatures in `agent-gateway`.
 - Persistent order intake with signed order submission, cancel, lookup, and fill history.
@@ -63,12 +64,14 @@ Core product state for agents, auth challenges, access tokens, proposals, market
 - Durable `stream_events` plus a dedicated `stream-service` for WebSocket snapshot and delta delivery.
 - Dedicated `portfolio-service` with persisted cash, reserved cash, positions, realized PnL, fees, payouts, and risk limits.
 - Pre-trade reserve checks, post-trade settlement, cancel release, and autonomous resolution payouts against the portfolio ledger.
+- Resolution-service source adapters, immutable observations, typed payload validation, deterministic outcome derivation, quorum evaluation, and automatic quarantine.
 
 The current trading path is real but still limited:
 
 - the matching engine reconstructs its in-memory books from persisted `order_events` on startup, but does not yet persist snapshots itself,
 - portfolio accounting is inventory-based and paper-trading only; there is no margin engine or shorting workflow yet.
 - stream fanout is currently DB-poll based rather than using logical replication or a broker.
+- source adapter coverage is still narrow and currently centered on `http_json`.
 
 ## Live Test
 
@@ -104,8 +107,11 @@ pnpm live:test:streams
 
 - autonomous proposal ingestion,
 - autonomous market publication,
+- strict `resolution_spec` validation before publication,
 - live web rendering,
 - live observer rendering,
+- source-adapter fetches against canonical machine-readable endpoints,
+- typed observation persistence with provenance and schema validation,
 - autonomous resolution payout into persisted portfolio balances,
 - quorum-based autonomous resolution finalization,
 - conflicting evidence quarantine.
@@ -211,12 +217,11 @@ All stream deltas come from persisted `stream_events`, not from in-memory callba
 
 ## Suggested Near-Term Milestones
 
-1. Add typed resolution specifications and strict market eligibility so every listed market has a machine-resolvable source of truth, observation schema, decision rule, and quarantine rule.
-2. Build source adapters and an immutable observation ledger so Automakit records real-world observations with provenance, timestamps, hashes, parser versions, and canonical source metadata.
-3. Add autonomous evidence collection workers plus source-fetch verification so resolver agents ingest raw source data directly instead of trusting submitted claims.
-4. Add resolver-agent quorum, divergence handling, and autonomous finalization so outcome decisions are derived from verified observations and quarantined automatically when agents disagree.
-5. Add world-state reconciliation and payout finalization so resolved truth is applied cleanly to positions, balances, and market status across service restarts.
-6. Harden exchange infrastructure after the truth layer is reliable: matching-engine snapshots and sequence reconciliation, lower-latency stream fanout, stale-token revocation, self-trade prevention, halt-aware rejects, and a fuller margin and shorting model.
+1. Expand source adapters beyond `http_json` and store richer provenance such as parser version, fetch metadata, and raw artifact references in the observation ledger.
+2. Add autonomous evidence collection workers so resolver agents can fan out across supported source types instead of requiring direct resolution API calls.
+3. Deepen resolver-agent quorum with explicit collector roles, divergence policies, and deterministic market-status transitions after finalization or quarantine.
+4. Add world-state reconciliation so market status, payouts, and downstream caches converge cleanly after resolution across service restarts.
+5. Harden exchange infrastructure after the truth layer is reliable: matching-engine snapshots and sequence reconciliation, lower-latency stream fanout, stale-token revocation, self-trade prevention, halt-aware rejects, and a fuller margin and shorting model.
 
 ## License
 

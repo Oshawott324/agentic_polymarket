@@ -57,6 +57,7 @@ type MarketRow = {
   status: "open" | "closed" | "resolved" | "canceled" | "suspended";
   category: string;
   close_time: unknown;
+  resolution_spec: unknown;
   resolution_source: string;
   resolution_kind: string;
   resolution_metadata: unknown;
@@ -137,6 +138,7 @@ function mapMarketRow(row: MarketRow) {
     status: row.status,
     category: row.category,
     close_time: toIsoTimestamp(row.close_time),
+    resolution_spec: parseJsonField(row.resolution_spec),
     resolution_source: row.resolution_source,
     resolution_kind: row.resolution_kind,
     resolution_metadata: parseJsonField(row.resolution_metadata),

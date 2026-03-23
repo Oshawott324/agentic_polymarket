@@ -6,7 +6,7 @@ import {
   toIsoTimestamp,
   toNumberOrNull,
 } from "@automakit/persistence";
-import type { ResolutionKind, ResolutionMetadata } from "@automakit/sdk-types";
+import type { ResolutionKind, ResolutionSpec } from "@automakit/sdk-types";
 import { randomUUID } from "node:crypto";
 import type { PoolClient } from "pg";
 
@@ -19,9 +19,10 @@ type MarketRecord = {
   status: "open" | "closed" | "resolved" | "canceled" | "suspended";
   category: string;
   close_time: string;
+  resolution_spec: ResolutionSpec;
   resolution_source: string;
   resolution_kind: ResolutionKind;
-  resolution_metadata: ResolutionMetadata;
+  resolution_metadata: ResolutionSpec["decision_rule"];
   last_traded_price_yes: number | null;
   volume_24h: number;
   liquidity_score: number;
@@ -38,6 +39,7 @@ type MarketRow = {
   status: MarketRecord["status"];
   category: string;
   close_time: unknown;
+  resolution_spec: unknown;
   resolution_source: string;
   resolution_kind: ResolutionKind;
   resolution_metadata: unknown;
@@ -83,9 +85,10 @@ function mapMarketRow(row: MarketRow): MarketRecord {
     status: row.status,
     category: row.category,
     close_time: toIsoTimestamp(row.close_time),
+    resolution_spec: parseJsonField<ResolutionSpec>(row.resolution_spec),
     resolution_source: row.resolution_source,
     resolution_kind: row.resolution_kind,
-    resolution_metadata: parseJsonField<ResolutionMetadata>(row.resolution_metadata),
+    resolution_metadata: parseJsonField<ResolutionSpec["decision_rule"]>(row.resolution_metadata),
     last_traded_price_yes: toNumberOrNull(row.last_traded_price_yes),
     volume_24h: Number(row.volume_24h),
     liquidity_score: Number(row.liquidity_score),
@@ -190,6 +193,7 @@ app.get("/v1/markets", async () => {
         status,
         category,
         close_time,
+        resolution_spec,
         resolution_source,
         resolution_kind,
         resolution_metadata,
@@ -216,9 +220,7 @@ app.post("/v1/internal/markets", async (request, reply) => {
     category?: string;
     close_time?: string;
     resolution_criteria?: string;
-    source_of_truth_url?: string;
-    resolution_kind?: ResolutionKind;
-    resolution_metadata?: ResolutionMetadata;
+    resolution_spec?: ResolutionSpec;
   };
 
   if (
@@ -226,9 +228,7 @@ app.post("/v1/internal/markets", async (request, reply) => {
     !body.title ||
     !body.close_time ||
     !body.resolution_criteria ||
-    !body.source_of_truth_url ||
-    !body.resolution_kind ||
-    !body.resolution_metadata
+    !body.resolution_spec
   ) {
     reply.code(400);
     return { error: "invalid_market_creation_request" };
@@ -245,6 +245,7 @@ app.post("/v1/internal/markets", async (request, reply) => {
         status,
         category,
         close_time,
+        resolution_spec,
         resolution_source,
         resolution_kind,
         resolution_metadata,
@@ -278,6 +279,7 @@ app.post("/v1/internal/markets", async (request, reply) => {
           status,
           category,
           close_time,
+          resolution_spec,
           resolution_source,
           resolution_kind,
           resolution_metadata,
@@ -288,7 +290,7 @@ app.post("/v1/internal/markets", async (request, reply) => {
           rules
         )
         VALUES (
-          $1, $2, $3, $4, $5, $6, $7, $8::timestamptz, $9, $10, $11::jsonb, $12, $13, $14, $15::jsonb, $16
+          $1, $2, $3, $4, $5, $6, $7, $8::timestamptz, $9::jsonb, $10, $11, $12::jsonb, $13, $14, $15, $16::jsonb, $17
         )
         RETURNING
           id,
@@ -299,6 +301,7 @@ app.post("/v1/internal/markets", async (request, reply) => {
           status,
           category,
           close_time,
+          resolution_spec,
           resolution_source,
           resolution_kind,
           resolution_metadata,
@@ -317,9 +320,10 @@ app.post("/v1/internal/markets", async (request, reply) => {
         "open",
         body.category ?? "uncategorized",
         body.close_time,
-        body.source_of_truth_url,
-        body.resolution_kind,
-        JSON.stringify(body.resolution_metadata),
+        JSON.stringify(body.resolution_spec),
+        body.resolution_spec.source.canonical_url,
+        body.resolution_spec.kind,
+        JSON.stringify(body.resolution_spec.decision_rule),
         null,
         0,
         0,
@@ -364,6 +368,7 @@ app.get("/v1/markets/:marketId", async (request, reply) => {
         status,
         category,
         close_time,
+        resolution_spec,
         resolution_source,
         resolution_kind,
         resolution_metadata,

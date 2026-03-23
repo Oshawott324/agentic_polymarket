@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { createHash, generateKeyPairSync, sign as signDetached, type KeyObject } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
+import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -236,6 +237,7 @@ async function waitForCondition(predicate: () => boolean, description: string, t
 async function main() {
   const databasePort = await reservePort();
   const matchingEnginePort = await reservePort();
+  const sourcePort = await reservePort();
   const databaseDirectory = await mkdtemp(path.join(os.tmpdir(), "automakit-streams-"));
   const databaseUrl = `postgres://postgres:postgres@127.0.0.1:${databasePort}/postgres`;
   const repoRoot = process.cwd();
@@ -244,7 +246,25 @@ async function main() {
   const processes: ManagedProcess[] = [];
   let streamSocket: WebSocket | null = null;
   let replaySocket: WebSocket | null = null;
+  const sourceServer = http.createServer((request, response) => {
+    if (request.url === "/sources/btc") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(
+        JSON.stringify({
+          price: 121000,
+          observed_at: new Date().toISOString(),
+        }),
+      );
+      return;
+    }
+
+    response.writeHead(404);
+    response.end();
+  });
   try {
+    await new Promise<void>((resolve) => {
+      sourceServer.listen(sourcePort, "127.0.0.1", () => resolve());
+    });
     processes.push(
       startProcess(
         "database",
@@ -352,12 +372,43 @@ async function main() {
         category: "crypto",
         close_time: "2026-12-31T23:59:59Z",
         resolution_criteria: "Resolve YES if BTC closes above 120,000 USD by the close time.",
-        source_of_truth_url: "https://www.cmegroup.com/",
-        resolution_kind: "price_threshold",
-        resolution_metadata: {
+        resolution_spec: {
           kind: "price_threshold",
-          operator: "gt",
-          threshold: 120000,
+          source: {
+            adapter: "http_json",
+            canonical_url: `http://127.0.0.1:${sourcePort}/sources/btc`,
+            allowed_domains: ["127.0.0.1", "localhost"],
+          },
+          observation_schema: {
+            type: "object",
+            fields: {
+              price: {
+                type: "number",
+                path: "price",
+              },
+              observed_at: {
+                type: "string",
+                path: "observed_at",
+              },
+            },
+          },
+          decision_rule: {
+            kind: "price_threshold",
+            observation_field: "price",
+            operator: "gt",
+            threshold: 120000,
+          },
+          quorum_rule: {
+            min_observations: 2,
+            min_distinct_collectors: 2,
+            agreement: "all",
+          },
+          quarantine_rule: {
+            on_source_fetch_failure: true,
+            on_schema_validation_failure: true,
+            on_observation_conflict: true,
+            max_observation_age_seconds: 3600,
+          },
         },
       }),
     });
@@ -465,37 +516,32 @@ async function main() {
       throw new Error(`Taker order failed with ${takerOrderResponse.status}`);
     }
 
-    const evidenceBody = {
-      market_id: market.id,
-      evidence_type: "url" as const,
-      summary: "BTC observation from CME",
-      source_url: "https://www.cmegroup.com/",
-      observed_at: new Date().toISOString(),
-      observation_payload: {
-        price: 121000,
-      },
-    };
-    const evidenceHeaders = {
-      "content-type": "application/json",
-    };
-    const evidenceOne = await fetch("http://127.0.0.1:4006/v1/resolution-evidence", {
+    const evidenceOne = await fetch("http://127.0.0.1:4006/v1/resolution-collect", {
       method: "POST",
       headers: {
-        ...evidenceHeaders,
+        "content-type": "application/json",
         "x-agent-id": resolverA.id,
       },
-      body: JSON.stringify(evidenceBody),
+      body: JSON.stringify({
+        market_id: market.id,
+      }),
     });
-    const evidenceTwo = await fetch("http://127.0.0.1:4006/v1/resolution-evidence", {
+    const evidenceTwo = await fetch("http://127.0.0.1:4006/v1/resolution-collect", {
       method: "POST",
       headers: {
-        ...evidenceHeaders,
+        "content-type": "application/json",
         "x-agent-id": resolverB.id,
       },
-      body: JSON.stringify(evidenceBody),
+      body: JSON.stringify({
+        market_id: market.id,
+      }),
     });
     if (!evidenceOne.ok || !evidenceTwo.ok) {
-      throw new Error(`Resolution evidence failed: ${evidenceOne.status}/${evidenceTwo.status}`);
+      const firstBody = await evidenceOne.text();
+      const secondBody = await evidenceTwo.text();
+      throw new Error(
+        `Resolution collection failed: ${evidenceOne.status}/${evidenceTwo.status} bodies=${firstBody} | ${secondBody}`,
+      );
     }
 
     const replayConnection = await openStreamSocket(maker.token);
@@ -540,6 +586,7 @@ async function main() {
   } finally {
     streamSocket?.close();
     replaySocket?.close();
+    sourceServer.close();
     await Promise.all(processes.map((process) => stopProcess(process)));
     await rm(databaseDirectory, { recursive: true, force: true });
   }

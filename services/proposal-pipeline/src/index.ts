@@ -1,7 +1,11 @@
 import { randomUUID } from "node:crypto";
 import Fastify from "fastify";
 import { createDatabasePool, ensureCoreSchema, parseJsonField, toIsoTimestamp } from "@automakit/persistence";
-import type { ResolutionKind, ResolutionMetadata } from "@automakit/sdk-types";
+import {
+  type ResolutionKind,
+  type ResolutionSpec,
+  validateResolutionSpec,
+} from "@automakit/sdk-types";
 
 type Proposal = {
   id: string;
@@ -10,9 +14,10 @@ type Proposal = {
   category: string;
   close_time: string;
   resolution_criteria: string;
+  resolution_spec: ResolutionSpec;
   source_of_truth_url: string;
   resolution_kind: ResolutionKind;
-  resolution_metadata: ResolutionMetadata;
+  resolution_metadata: ResolutionSpec["decision_rule"];
   dedupe_key: string;
   origin: "agent" | "automation";
   signal_source_id?: string;
@@ -32,6 +37,7 @@ type ProposalRow = {
   category: string;
   close_time: unknown;
   resolution_criteria: string;
+  resolution_spec: unknown;
   source_of_truth_url: string;
   resolution_kind: ResolutionKind;
   resolution_metadata: unknown;
@@ -60,9 +66,10 @@ function mapProposalRow(row: ProposalRow): Proposal {
     category: row.category,
     close_time: toIsoTimestamp(row.close_time),
     resolution_criteria: row.resolution_criteria,
+    resolution_spec: parseJsonField<ResolutionSpec>(row.resolution_spec),
     source_of_truth_url: row.source_of_truth_url,
     resolution_kind: row.resolution_kind,
-    resolution_metadata: parseJsonField<ResolutionMetadata>(row.resolution_metadata),
+    resolution_metadata: parseJsonField<ResolutionSpec["decision_rule"]>(row.resolution_metadata),
     dedupe_key: row.dedupe_key,
     origin: row.origin,
     signal_source_id: row.signal_source_id ?? undefined,
@@ -112,6 +119,7 @@ async function saveProposal(proposal: Proposal) {
         category,
         close_time,
         resolution_criteria,
+        resolution_spec,
         source_of_truth_url,
         resolution_kind,
         resolution_metadata,
@@ -127,7 +135,7 @@ async function saveProposal(proposal: Proposal) {
         created_at
       )
       VALUES (
-        $1, $2, $3, $4, $5::timestamptz, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19::timestamptz
+        $1, $2, $3, $4, $5::timestamptz, $6, $7::jsonb, $8, $9, $10::jsonb, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20::timestamptz
       )
       ON CONFLICT (id) DO UPDATE SET
         proposer_agent_id = EXCLUDED.proposer_agent_id,
@@ -135,6 +143,7 @@ async function saveProposal(proposal: Proposal) {
         category = EXCLUDED.category,
         close_time = EXCLUDED.close_time,
         resolution_criteria = EXCLUDED.resolution_criteria,
+        resolution_spec = EXCLUDED.resolution_spec,
         source_of_truth_url = EXCLUDED.source_of_truth_url,
         resolution_kind = EXCLUDED.resolution_kind,
         resolution_metadata = EXCLUDED.resolution_metadata,
@@ -157,6 +166,7 @@ async function saveProposal(proposal: Proposal) {
       proposal.category,
       proposal.close_time,
       proposal.resolution_criteria,
+      JSON.stringify(proposal.resolution_spec),
       proposal.source_of_truth_url,
       proposal.resolution_kind,
       JSON.stringify(proposal.resolution_metadata),
@@ -181,49 +191,23 @@ app.get("/health", async () => ({ service: "proposal-pipeline", status: "ok" }))
 function scoreProposal(input: {
   category?: string;
   title?: string;
-  source_of_truth_url?: string;
   signal_source_type?: "calendar" | "news" | "agent";
-  resolution_kind?: ResolutionKind;
-  resolution_metadata?: ResolutionMetadata;
+  resolution_spec?: ResolutionSpec;
 }): { confidenceScore: number; status: Proposal["status"]; autonomyNote: string } {
-  if (!input.title || !input.source_of_truth_url) {
+  if (!input.title || !input.resolution_spec) {
     return {
       confidenceScore: 0,
       status: "suppressed" as const,
-      autonomyNote: "Missing required title or source of truth.",
+      autonomyNote: "Missing required title or resolution specification.",
     };
   }
 
-  if (!input.resolution_kind || !input.resolution_metadata) {
+  const validation = validateResolutionSpec(input.resolution_spec);
+  if (!validation.ok) {
     return {
       confidenceScore: 0,
       status: "suppressed" as const,
-      autonomyNote: "Missing deterministic resolution definition.",
-    };
-  }
-
-  if (
-    input.resolution_kind === "price_threshold" &&
-    !(
-      input.resolution_metadata.kind === "price_threshold" &&
-      typeof input.resolution_metadata.threshold === "number"
-    )
-  ) {
-    return {
-      confidenceScore: 0,
-      status: "suppressed" as const,
-      autonomyNote: "Invalid price-threshold resolution metadata.",
-    };
-  }
-
-  if (
-    input.resolution_kind === "rate_decision" &&
-    !(input.resolution_metadata.kind === "rate_decision")
-  ) {
-    return {
-      confidenceScore: 0,
-      status: "suppressed" as const,
-      autonomyNote: "Invalid rate-decision resolution metadata.",
+      autonomyNote: `Suppressed because resolution specification is invalid: ${validation.errors.join(", ")}`,
     };
   }
 
@@ -237,7 +221,7 @@ function scoreProposal(input: {
   if (input.signal_source_type === "news") {
     confidenceScore -= 0.05;
   }
-  if (/federalreserve|cmegroup|sec|treasury/i.test(input.source_of_truth_url)) {
+  if (/federalreserve|cmegroup|sec|treasury|localhost|127\.0\.0\.1/i.test(input.resolution_spec.source.canonical_url)) {
     confidenceScore += 0.12;
   }
   if (input.category === "crypto" || input.category === "macro") {
@@ -272,9 +256,7 @@ async function publishMarketFromProposal(proposal: Proposal) {
       category: proposal.category,
       close_time: proposal.close_time,
       resolution_criteria: proposal.resolution_criteria,
-      source_of_truth_url: proposal.source_of_truth_url,
-      resolution_kind: proposal.resolution_kind,
-      resolution_metadata: proposal.resolution_metadata,
+      resolution_spec: proposal.resolution_spec,
     }),
   });
 
@@ -288,6 +270,13 @@ async function publishMarketFromProposal(proposal: Proposal) {
 
 async function maybePublishQueuedProposal(proposal: Proposal) {
   if (proposal.status !== "queued") {
+    return proposal;
+  }
+
+  const validation = validateResolutionSpec(proposal.resolution_spec);
+  if (!validation.ok) {
+    proposal.status = "suppressed";
+    proposal.autonomy_note = `Suppressed because resolution specification is invalid: ${validation.errors.join(", ")}`;
     return proposal;
   }
 
@@ -320,9 +309,7 @@ app.post("/v1/market-proposals", async (request, reply) => {
     category?: string;
     close_time?: string;
     resolution_criteria?: string;
-    source_of_truth_url?: string;
-    resolution_kind?: ResolutionKind;
-    resolution_metadata?: ResolutionMetadata;
+    resolution_spec?: ResolutionSpec;
     dedupe_key?: string;
     origin?: "agent" | "automation";
     signal_source_id?: string;
@@ -344,6 +331,9 @@ app.post("/v1/market-proposals", async (request, reply) => {
   }
 
   const decision = scoreProposal(body);
+  const resolutionSpecValidation = body.resolution_spec ? validateResolutionSpec(body.resolution_spec) : null;
+  const resolutionSpec =
+    resolutionSpecValidation && resolutionSpecValidation.ok ? resolutionSpecValidation.spec : null;
 
   const proposal: Proposal = {
     id: randomUUID(),
@@ -352,15 +342,52 @@ app.post("/v1/market-proposals", async (request, reply) => {
     category: body.category ?? "uncategorized",
     close_time: body.close_time ?? new Date(Date.now() + 7 * 24 * 60 * 60_000).toISOString(),
     resolution_criteria: body.resolution_criteria ?? "TBD",
-    source_of_truth_url: body.source_of_truth_url ?? "https://example.com",
-    resolution_kind: body.resolution_kind ?? "price_threshold",
-    resolution_metadata:
-      body.resolution_metadata ??
+    resolution_spec:
+      resolutionSpec ??
       ({
         kind: "price_threshold",
+        source: {
+          adapter: "http_json",
+          canonical_url: "https://invalid.example",
+          allowed_domains: ["invalid.example"],
+        },
+        observation_schema: {
+          type: "object",
+          fields: {
+            price: {
+              type: "number",
+              path: "price",
+            },
+          },
+        },
+        decision_rule: {
+          kind: "price_threshold",
+          observation_field: "price",
+          operator: "gt",
+          threshold: 0,
+        },
+        quorum_rule: {
+          min_observations: 2,
+          min_distinct_collectors: 2,
+          agreement: "all",
+        },
+        quarantine_rule: {
+          on_source_fetch_failure: true,
+          on_schema_validation_failure: true,
+          on_observation_conflict: true,
+          max_observation_age_seconds: 3600,
+        },
+      } satisfies ResolutionSpec),
+    source_of_truth_url: resolutionSpec?.source.canonical_url ?? "https://invalid.example",
+    resolution_kind: resolutionSpec?.kind ?? "price_threshold",
+    resolution_metadata:
+      resolutionSpec?.decision_rule ??
+      ({
+        kind: "price_threshold",
+        observation_field: "price",
         operator: "gt",
         threshold: 0,
-      } satisfies ResolutionMetadata),
+      } satisfies ResolutionSpec["decision_rule"]),
     dedupe_key: dedupeKey,
     origin: body.origin ?? "agent",
     signal_source_id: body.signal_source_id,
