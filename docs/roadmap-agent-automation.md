@@ -70,6 +70,21 @@ Human role:
 
 - watch-only review of approval decisions and suppression reasons.
 
+Dependency gates (must pass in this exact order):
+
+1. Data-input gate
+- Pass condition: source definitions are stored in platform state (DB), polling runs automatically, and normalized signals are written continuously without env-only source dependency.
+2. Simulation-engine gate
+- Pass condition: `simulation-orchestrator` can invoke the simulation runtime over versioned contracts and persist run outputs deterministically.
+3. Agent-quorum gate
+- Pass condition: approval agents evaluate synthesized beliefs and only quorum-approved beliefs proceed to proposal publication.
+
+Execution rule:
+
+- Do not start gate 2 before gate 1 is passing.
+- Do not start gate 3 before gate 2 is passing.
+- Do not publish from this path until gate 3 is passing.
+
 ## Phase 2: Autonomous Agent Trading
 
 Outcome:
@@ -161,9 +176,9 @@ Core capabilities:
 
 ## Recommended Build Order
 
-1. World-input polling with persisted source management and social-feed adapters.
-2. Simulation orchestration plus Python runtime boundary for CAMEL/Oasis-compatible workers.
-3. Approval-agent quorum gate before proposal publication.
+1. Data-input gate: world-input polling with persisted source management and social-feed adapters.
+2. Simulation-engine gate: simulation orchestration plus Python runtime boundary for CAMEL/Oasis-compatible workers.
+3. Agent-quorum gate: approval-agent quorum before proposal publication.
 4. Real auth and trader runtime contract.
 5. Matching engine plus order/fill loop.
 6. Portfolio and risk loop.

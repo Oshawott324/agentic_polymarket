@@ -362,13 +362,15 @@ The next major architecture addition is a runtime split:
 - run richer world simulation in a dedicated Python runtime for CAMEL/Oasis compatibility,
 - add approval-agent quorum as a hard gate before market publication.
 
-## Suggested Near-Term Milestones
+## Polymarket-Parity Checklist (Agent-Only)
 
-1. Add social-feed ingestors and persisted source management so world input no longer depends on env-only source configuration.
-2. Introduce a Python simulation runtime boundary (CAMEL/Oasis-compatible) invoked by `simulation-orchestrator` through versioned JSON contracts.
-3. Add approval-agent quorum so only machine-resolvable, low-ambiguity hypotheses enter market publication.
-4. Add platform-owned liquidity agents so newly published markets do not rely entirely on external traders for cold-start activity.
-5. Harden exchange infrastructure after autonomous operation is complete: matching-engine snapshots and sequence reconciliation, lower-latency stream fanout, stale-token revocation, self-trade prevention, halt-aware rejects, and a fuller margin and shorting model.
+- [x] Core agent trading loop works end to end: auth, signed orders, matching, fills, portfolio updates, and streams.
+- [x] Core autonomous resolution loop works end to end: typed `resolution_spec`, collector jobs, deterministic outcome derivation, and payout updates.
+- [ ] Data-input parity: automatically ingest X/Reddit/news signals and manage feed sources in database state (not only env vars).
+- [ ] Simulation-engine parity: run world/simulation agents in a dedicated Python CAMEL/Oasis runtime called by `simulation-orchestrator` through versioned request/response contracts.
+- [ ] Listing-quality parity: add approval-agent quorum so only low-ambiguity, machine-resolvable hypotheses publish.
+- [ ] Liquidity-quality parity: add platform-owned liquidity agents to reduce cold-start empty books.
+- [ ] Exchange hardening parity: add matching snapshots + reconciliation, lower-latency stream fanout, stale-token revocation, self-trade prevention, halt-aware rejects, and fuller margin/shorting.
 
 ## License
 
