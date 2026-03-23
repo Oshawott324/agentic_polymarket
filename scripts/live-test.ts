@@ -159,11 +159,14 @@ function restartProcess(processes: ManagedProcess[], process: ManagedProcess) {
 async function main() {
   const databasePort = await reservePort();
   const feedPort = await reservePort();
+  const collectorAlphaPort = await reservePort();
+  const collectorBetaPort = await reservePort();
   const databaseDirectory = await mkdtemp(path.join(os.tmpdir(), "automakit-live-test-"));
   const databaseUrl = `postgres://postgres:postgres@127.0.0.1:${databasePort}/postgres`;
   const repoRoot = process.cwd();
   const nextBin = path.join(repoRoot, "node_modules", ".pnpm", "node_modules", ".bin", "next");
   const pgliteServerBin = path.join(repoRoot, "node_modules", ".bin", "pglite-server");
+  const resolvedCloseTime = new Date(Date.now() - 60_000).toISOString();
   const signalPayload = {
     items: [
       {
@@ -171,7 +174,7 @@ async function main() {
         sourceType: "calendar",
         category: "crypto",
         headline: "Will BTC trade above $100k by June 30, 2026?",
-        closeTime: "2026-06-30T23:59:59Z",
+        closeTime: resolvedCloseTime,
         resolutionCriteria:
           "Resolve YES if BTC spot trades above 100,000 USD on or before the close time.",
         resolutionSpec: {
@@ -218,7 +221,7 @@ async function main() {
         sourceType: "calendar",
         category: "macro",
         headline: "Will the Fed cut rates before July 31, 2026?",
-        closeTime: "2026-07-31T23:59:59Z",
+        closeTime: resolvedCloseTime,
         resolutionCriteria:
           "Resolve YES if the federal funds target range is lowered before the close time.",
         resolutionSpec: {
@@ -398,6 +401,38 @@ async function main() {
     );
     processes.push(
       startProcess(
+        "resolution-collector-alpha",
+        process.execPath,
+        ["dist/index.js"],
+        {
+          DATABASE_URL: databaseUrl,
+          MARKET_SERVICE_URL: "http://127.0.0.1:4003",
+          RESOLUTION_SERVICE_URL: "http://127.0.0.1:4006",
+          COLLECTOR_AGENT_ID: "resolver-alpha",
+          RESOLUTION_COLLECTOR_PORT: String(collectorAlphaPort),
+          RESOLUTION_COLLECTOR_INTERVAL_MS: "500",
+        },
+        path.join(repoRoot, "services", "resolution-collector"),
+      ),
+    );
+    processes.push(
+      startProcess(
+        "resolution-collector-beta",
+        process.execPath,
+        ["dist/index.js"],
+        {
+          DATABASE_URL: databaseUrl,
+          MARKET_SERVICE_URL: "http://127.0.0.1:4003",
+          RESOLUTION_SERVICE_URL: "http://127.0.0.1:4006",
+          COLLECTOR_AGENT_ID: "resolver-beta",
+          RESOLUTION_COLLECTOR_PORT: String(collectorBetaPort),
+          RESOLUTION_COLLECTOR_INTERVAL_MS: "500",
+        },
+        path.join(repoRoot, "services", "resolution-collector"),
+      ),
+    );
+    processes.push(
+      startProcess(
         "web",
         nextBin,
         ["start", "-p", "3000"],
@@ -423,6 +458,8 @@ async function main() {
     await waitForJson("http://127.0.0.1:4004/health");
     await waitForJson("http://127.0.0.1:4005/health");
     await waitForJson("http://127.0.0.1:4006/health");
+    await waitForJson(`http://127.0.0.1:${collectorAlphaPort}/health`);
+    await waitForJson(`http://127.0.0.1:${collectorBetaPort}/health`);
     await waitForText("http://127.0.0.1:3000", "Markets");
     await waitForText("http://127.0.0.1:3001/proposals", "Proposal Queue");
 
@@ -471,39 +508,18 @@ async function main() {
     await waitForText("http://127.0.0.1:3000", "Will BTC trade above $100k by June 30, 2026?");
     await waitForText("http://127.0.0.1:3001/proposals", "Will the Fed cut rates before July 31, 2026?");
 
-    for (const agentId of ["resolver-alpha", "resolver-beta"]) {
-      const evidenceResponse = await fetch("http://127.0.0.1:4006/v1/resolution-collect", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-agent-id": agentId,
-        },
-        body: JSON.stringify({
-          market_id: btcMarket.id,
-        }),
-      });
-
-      if (!evidenceResponse.ok) {
-        throw new Error(`Resolution collection failed with ${evidenceResponse.status}`);
-      }
-    }
-
-    for (const agentId of ["resolver-gamma", "resolver-delta"]) {
-      const evidenceResponse = await fetch("http://127.0.0.1:4006/v1/resolution-collect", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-agent-id": agentId,
-        },
-        body: JSON.stringify({
-          market_id: fedMarket.id,
-        }),
-      });
-
-      if (!evidenceResponse.ok) {
-        throw new Error(`Conflicting resolution collection failed with ${evidenceResponse.status}`);
-      }
-    }
+    await waitForCondition("autonomous resolutions", async () => {
+      const resolutions = (await waitForJson("http://127.0.0.1:4006/v1/resolutions")) as {
+        items: Array<{ market_id: string; status: string; final_outcome: string | null }>;
+      };
+      const finalizedResolution = resolutions.items.find((entry) => entry.market_id === btcMarket.id);
+      const quarantinedResolution = resolutions.items.find((entry) => entry.market_id === fedMarket.id);
+      return (
+        finalizedResolution?.status === "finalized" &&
+        finalizedResolution.final_outcome === "YES" &&
+        quarantinedResolution?.status === "quarantined"
+      );
+    });
 
     const resolutions = (await waitForJson("http://127.0.0.1:4006/v1/resolutions")) as {
       items: Array<{ market_id: string; status: string; final_outcome: string | null }>;
@@ -521,6 +537,21 @@ async function main() {
 
     if (!quarantinedResolution || quarantinedResolution.status !== "quarantined") {
       throw new Error(`Expected quarantined resolution state: ${JSON.stringify(resolutions.items)}`);
+    }
+
+    const resolvedMarketDetail = (await waitForJson(`http://127.0.0.1:4003/v1/markets/${btcMarket.id}`)) as {
+      status: string;
+    };
+    const quarantinedMarketDetail = (await waitForJson(`http://127.0.0.1:4003/v1/markets/${fedMarket.id}`)) as {
+      status: string;
+    };
+    if (resolvedMarketDetail.status !== "resolved" || quarantinedMarketDetail.status !== "suspended") {
+      throw new Error(
+        `Unexpected market statuses after autonomous resolution: ${JSON.stringify({
+          btc: resolvedMarketDetail,
+          fed: quarantinedMarketDetail,
+        })}`,
+      );
     }
 
     const marketCreator = processes.find((entry) => entry.name === "market-creator");
@@ -561,7 +592,7 @@ async function main() {
     }
 
     const persistedMarkets = (await waitForJson("http://127.0.0.1:4003/v1/markets")) as {
-      items: Array<{ id: string; title: string }>;
+      items: Array<{ id: string; title: string; status: string }>;
     };
     if (
       persistedMarkets.items.length < 2 ||
@@ -569,6 +600,12 @@ async function main() {
       !persistedMarkets.items.some((market) => market.id === fedMarket.id)
     ) {
       throw new Error(`Markets were not persisted across restart: ${JSON.stringify(persistedMarkets.items)}`);
+    }
+    if (!persistedMarkets.items.some((market) => market.id === btcMarket.id && market.status === "resolved")) {
+      throw new Error(`Resolved market status was not persisted: ${JSON.stringify(persistedMarkets.items)}`);
+    }
+    if (!persistedMarkets.items.some((market) => market.id === fedMarket.id && market.status === "suspended")) {
+      throw new Error(`Suspended market status was not persisted: ${JSON.stringify(persistedMarkets.items)}`);
     }
 
     const persistedResolutions = (await waitForJson("http://127.0.0.1:4006/v1/resolutions")) as {

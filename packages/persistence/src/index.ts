@@ -116,11 +116,30 @@ export async function ensureCoreSchema(pool: Pool) {
       source_url TEXT NOT NULL,
       source_adapter TEXT NOT NULL,
       source_hash TEXT NOT NULL,
+      parser_version TEXT NOT NULL DEFAULT 'resolution-runtime@1',
       observed_at TIMESTAMPTZ NOT NULL,
       observation_payload JSONB NOT NULL,
       created_at TIMESTAMPTZ NOT NULL,
       UNIQUE (market_id, collector_agent_id)
     );
+
+    CREATE TABLE IF NOT EXISTS resolution_collection_jobs (
+      id TEXT PRIMARY KEY,
+      market_id TEXT NOT NULL REFERENCES markets(id) ON DELETE CASCADE,
+      collector_agent_id TEXT NOT NULL,
+      status TEXT NOT NULL,
+      next_attempt_at TIMESTAMPTZ NOT NULL,
+      claimed_at TIMESTAMPTZ,
+      claim_expires_at TIMESTAMPTZ,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      created_at TIMESTAMPTZ NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL,
+      UNIQUE (market_id, collector_agent_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_resolution_collection_jobs_claimable
+      ON resolution_collection_jobs (collector_agent_id, status, next_attempt_at, claim_expires_at);
 
     CREATE TABLE IF NOT EXISTS orders (
       id TEXT PRIMARY KEY,
@@ -255,6 +274,7 @@ export async function ensureCoreSchema(pool: Pool) {
     ALTER TABLE orders ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
     ALTER TABLE proposals ADD COLUMN IF NOT EXISTS resolution_spec JSONB NOT NULL DEFAULT '{}'::jsonb;
     ALTER TABLE markets ADD COLUMN IF NOT EXISTS resolution_spec JSONB NOT NULL DEFAULT '{}'::jsonb;
+    ALTER TABLE observations ADD COLUMN IF NOT EXISTS parser_version TEXT NOT NULL DEFAULT 'resolution-runtime@1';
   `);
 }
 

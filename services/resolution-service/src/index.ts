@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import Fastify from "fastify";
 import {
   createDatabasePool,
@@ -7,11 +7,16 @@ import {
   toIsoTimestamp,
 } from "@automakit/persistence";
 import {
+  ResolutionRuntimeError,
+  collectObservationFromSource,
+  deriveDeterministicOutcome,
+  isAllowedSource,
+  sha256Hex,
+} from "@automakit/resolution-runtime";
+import {
   type ObservationPayload,
   type ResolutionOutcome,
   type ResolutionSpec,
-  deriveOutcomeFromResolutionSpec,
-  extractObservationPayloadFromJson,
   validateObservationPayload,
   validateResolutionSpec,
 } from "@automakit/sdk-types";
@@ -74,6 +79,8 @@ type ResolutionEvidenceRow = {
 type CollectObservationResult = {
   source_url: string;
   source_hash: string;
+  source_adapter: string;
+  parser_version: string;
   observed_at: string;
   observation_payload: ObservationPayload;
   derived_outcome: Outcome;
@@ -86,23 +93,6 @@ const pool = createDatabasePool();
 const marketServiceUrl = process.env.MARKET_SERVICE_URL ?? "http://localhost:4003";
 const portfolioServiceUrl = process.env.PORTFOLIO_SERVICE_URL ?? "http://localhost:4004";
 const defaultQuorumThreshold = Number(process.env.RESOLUTION_QUORUM_THRESHOLD ?? 2);
-
-function sha256Hex(value: string) {
-  return createHash("sha256").update(value).digest("hex");
-}
-
-function normalizeHostname(url: string) {
-  const hostname = new URL(url).hostname.toLowerCase();
-  return hostname.startsWith("www.") ? hostname.slice(4) : hostname;
-}
-
-function isAllowedSource(candidateUrl: string, allowedDomains: string[]) {
-  const candidateHost = normalizeHostname(candidateUrl);
-  return allowedDomains.some((domain) => {
-    const normalized = domain.toLowerCase();
-    return candidateHost === normalized || candidateHost.endsWith(`.${normalized}`);
-  });
-}
 
 async function appendStreamEvent(event: {
   market_id: string;
@@ -140,6 +130,22 @@ async function applyResolutionPayout(marketId: string, finalOutcome: "YES" | "NO
       market_id: marketId,
       final_outcome: finalOutcome,
     }),
+  });
+
+  return {
+    ok: response.ok,
+    status: response.status,
+    body: (await response.json()) as Record<string, unknown>,
+  };
+}
+
+async function updateMarketStatus(marketId: string, status: "resolved" | "canceled" | "suspended") {
+  const response = await fetch(`${marketServiceUrl}/v1/internal/markets/${marketId}/status`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ status }),
   });
 
   return {
@@ -283,83 +289,6 @@ async function upsertResolutionCase(marketId: string, definition: MarketResoluti
   return created;
 }
 
-function summarizeObservation(spec: ResolutionSpec, payload: ObservationPayload, outcome: Outcome) {
-  if (spec.kind === "price_threshold") {
-    return `Collected price observation for ${String(payload[spec.decision_rule.observation_field])}; derived ${outcome}.`;
-  }
-  return `Collected rate decision observation (${String(payload[spec.decision_rule.previous_field])} -> ${String(payload[spec.decision_rule.current_field])}); derived ${outcome}.`;
-}
-
-function getObservedAtFromPayload(payload: ObservationPayload) {
-  const observedAt = payload.observed_at;
-  if (typeof observedAt === "string" && !Number.isNaN(Date.parse(observedAt))) {
-    return new Date(observedAt).toISOString();
-  }
-  return new Date().toISOString();
-}
-
-async function collectObservationFromSource(definition: MarketResolutionDefinition): Promise<CollectObservationResult> {
-  const spec = definition.resolution_spec;
-  if (spec.source.adapter !== "http_json") {
-    throw new Error("unsupported_source_adapter");
-  }
-
-  if (!isAllowedSource(spec.source.canonical_url, spec.source.allowed_domains)) {
-    throw new Error("canonical_source_not_allowed_by_spec");
-  }
-
-  const response = await fetch(spec.source.canonical_url, {
-    method: spec.source.method ?? "GET",
-    headers: {
-      accept: "application/json",
-      ...(spec.source.headers ?? {}),
-    },
-  });
-  if (!response.ok) {
-    throw new Error(`source_fetch_failed:${response.status}`);
-  }
-
-  const rawBody = await response.text();
-  const sourceHash = sha256Hex(rawBody);
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(rawBody);
-  } catch {
-    throw new Error("source_payload_not_json");
-  }
-
-  const observationPayload = extractObservationPayloadFromJson(spec, parsed);
-  if (!observationPayload) {
-    throw new Error("source_payload_not_extractable");
-  }
-
-  const schemaErrors = validateObservationPayload(spec, observationPayload);
-  if (schemaErrors.length > 0) {
-    throw new Error(`observation_schema_validation_failed:${schemaErrors.join(",")}`);
-  }
-
-  const observedAt = getObservedAtFromPayload(observationPayload);
-  const ageSeconds = Math.max(0, Math.floor((Date.now() - Date.parse(observedAt)) / 1000));
-  if (ageSeconds > spec.quarantine_rule.max_observation_age_seconds) {
-    throw new Error("observation_too_old");
-  }
-
-  const derivedOutcome = deriveOutcomeFromResolutionSpec(spec, observationPayload);
-  if (!derivedOutcome) {
-    throw new Error("decision_rule_not_applicable");
-  }
-
-  return {
-    source_url: spec.source.canonical_url,
-    source_hash: sourceHash,
-    observed_at: observedAt,
-    observation_payload: observationPayload,
-    derived_outcome: derivedOutcome,
-    summary: summarizeObservation(spec, observationPayload, derivedOutcome),
-  };
-}
-
 async function saveObservationRecord(
   marketId: string,
   collectorAgentId: string,
@@ -374,18 +303,21 @@ async function saveObservationRecord(
         source_url,
         source_adapter,
         source_hash,
+        parser_version,
         observed_at,
         observation_payload,
         created_at
       )
-      VALUES ($1, $2, $3, $4, 'http_json', $5, $6::timestamptz, $7::jsonb, $8::timestamptz)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8::timestamptz, $9::jsonb, $10::timestamptz)
     `,
     [
       randomUUID(),
       marketId,
       collectorAgentId,
       collected.source_url,
+      collected.source_adapter,
       collected.source_hash,
+      collected.parser_version,
       collected.observed_at,
       JSON.stringify(collected.observation_payload),
       new Date().toISOString(),
@@ -540,6 +472,10 @@ async function quarantineResolutionCase(
     },
     created_at: resolutionCase.last_updated_at,
   });
+  const marketUpdate = await updateMarketStatus(marketId, "suspended");
+  if (!marketUpdate.ok && marketUpdate.status !== 404) {
+    throw new Error(`market_status_update_failed:${JSON.stringify(marketUpdate.body)}`);
+  }
   return resolutionCase;
 }
 
@@ -557,6 +493,21 @@ async function finalizeResolutionState(marketId: string, definition: MarketResol
     }
   }
 
+  if (resolutionCase.status === "finalized") {
+    const targetStatus = finalOutcome === "CANCELED" ? "canceled" : "resolved";
+    const marketUpdate = await updateMarketStatus(marketId, targetStatus);
+    if (!marketUpdate.ok) {
+      throw new Error(`market_status_update_failed:${JSON.stringify(marketUpdate.body)}`);
+    }
+  }
+
+  if (resolutionCase.status === "quarantined") {
+    const marketUpdate = await updateMarketStatus(marketId, "suspended");
+    if (!marketUpdate.ok) {
+      throw new Error(`market_status_update_failed:${JSON.stringify(marketUpdate.body)}`);
+    }
+  }
+
   await appendStreamEvent({
     market_id: marketId,
     payload: buildResolutionPayload(resolutionCase),
@@ -564,6 +515,16 @@ async function finalizeResolutionState(marketId: string, definition: MarketResol
   });
 
   return resolutionCase;
+}
+
+async function persistCollectedObservation(
+  marketId: string,
+  collectorAgentId: string,
+  collected: CollectObservationResult,
+) {
+  await saveObservationRecord(marketId, collectorAgentId, collected);
+  const evidence = await saveResolutionEvidence(marketId, collectorAgentId, collected);
+  return evidence;
 }
 
 async function collectAndPersistObservation(marketId: string, collectorAgentId: string) {
@@ -574,16 +535,18 @@ async function collectAndPersistObservation(marketId: string, collectorAgentId: 
   }
 
   try {
-    const collected = await collectObservationFromSource(definition);
-    await saveObservationRecord(marketId, collectorAgentId, collected);
-    const evidence = await saveResolutionEvidence(marketId, collectorAgentId, collected);
+    const collected = await collectObservationFromSource(definition.resolution_spec);
+    const evidence = await persistCollectedObservation(marketId, collectorAgentId, collected);
     const resolutionCase = await finalizeResolutionState(marketId, definition);
     return {
       evidence,
       resolutionCase,
     };
   } catch (error) {
-    const message = String(error);
+    const message =
+      error instanceof ResolutionRuntimeError && error.message !== error.code
+        ? error.message
+        : String(error);
     if (
       definition.resolution_spec.quarantine_rule.on_source_fetch_failure ||
       definition.resolution_spec.quarantine_rule.on_schema_validation_failure
@@ -601,6 +564,11 @@ async function ingestManualObservation(
   observationPayload: ObservationPayload,
   observedAt: string,
   summary: string,
+  options?: {
+    source_hash?: string;
+    source_adapter?: string;
+    parser_version?: string;
+  },
 ) {
   const definition = await fetchMarketResolutionDefinition(marketId);
   const existing = await upsertResolutionCase(marketId, definition);
@@ -619,23 +587,45 @@ async function ingestManualObservation(
     throw new Error(`observation_schema_validation_failed:${schemaErrors.join(",")}`);
   }
 
-  const derivedOutcome = deriveOutcomeFromResolutionSpec(definition.resolution_spec, observationPayload);
-  if (!derivedOutcome) {
-    throw new Error("decision_rule_not_applicable");
-  }
+  const derivedOutcome = deriveDeterministicOutcome(definition.resolution_spec, observationPayload);
 
   const collected: CollectObservationResult = {
     source_url: sourceUrl,
-    source_hash: sha256Hex(JSON.stringify(observationPayload)),
+    source_hash: options?.source_hash ?? sha256Hex(JSON.stringify(observationPayload)),
+    source_adapter: options?.source_adapter ?? definition.resolution_spec.source.adapter,
+    parser_version: options?.parser_version ?? "manual-observation@1",
     observed_at: observedAt,
     observation_payload: observationPayload,
     derived_outcome: derivedOutcome,
     summary,
   };
-  await saveObservationRecord(marketId, collectorAgentId, collected);
-  const evidence = await saveResolutionEvidence(marketId, collectorAgentId, collected);
+  const evidence = await persistCollectedObservation(marketId, collectorAgentId, collected);
   const resolutionCase = await finalizeResolutionState(marketId, definition);
   return { evidence, resolutionCase };
+}
+
+async function reportCollectionFailure(
+  marketId: string,
+  collectorAgentId: string,
+  failureKind: "source_fetch" | "schema_validation" | "decision_rule" | "unknown",
+  reason: string,
+) {
+  const definition = await fetchMarketResolutionDefinition(marketId);
+  const existing = await upsertResolutionCase(marketId, definition);
+  if (existing.status === "finalized" || existing.status === "quarantined") {
+    return existing;
+  }
+
+  const shouldQuarantine =
+    (failureKind === "schema_validation" &&
+      definition.resolution_spec.quarantine_rule.on_schema_validation_failure) ||
+    (failureKind === "source_fetch" && definition.resolution_spec.quarantine_rule.on_source_fetch_failure);
+
+  if (shouldQuarantine) {
+    return quarantineResolutionCase(marketId, definition, `${collectorAgentId}:${reason}`);
+  }
+
+  return existing;
 }
 
 app.get("/health", async () => ({ service: "resolution-service", status: "ok" }));
@@ -678,6 +668,86 @@ app.post("/v1/internal/resolution-collect", async (request, reply) => {
     const message = String(error);
     reply.code(message.includes("already_finalized") ? 409 : 422);
     return { error: message };
+  }
+});
+
+app.post("/v1/internal/resolution-observations", async (request, reply) => {
+  const body = request.body as {
+    market_id?: string;
+    collector_agent_id?: string;
+    source_url?: string;
+    source_hash?: string;
+    source_adapter?: string;
+    parser_version?: string;
+    observed_at?: string;
+    observation_payload?: ObservationPayload;
+    summary?: string;
+  };
+  if (
+    !body.market_id ||
+    !body.collector_agent_id ||
+    !body.source_url ||
+    !body.source_hash ||
+    !body.source_adapter ||
+    !body.parser_version ||
+    !body.observed_at ||
+    !body.observation_payload ||
+    !body.summary
+  ) {
+    reply.code(400);
+    return { error: "invalid_internal_resolution_observation_request" };
+  }
+
+  try {
+    const result = await ingestManualObservation(
+      body.market_id,
+      body.collector_agent_id,
+      body.source_url,
+      body.observation_payload,
+      body.observed_at,
+      body.summary,
+      {
+        source_hash: body.source_hash,
+        source_adapter: body.source_adapter,
+        parser_version: body.parser_version,
+      },
+    );
+    reply.code(201);
+    return result.evidence;
+  } catch (error) {
+    const message = String(error);
+    if (message.includes("duplicate key value") || message.includes("duplicate_resolver_agent")) {
+      reply.code(200);
+      return { status: "noop_duplicate" };
+    }
+    reply.code(message.includes("already_finalized") ? 409 : 422);
+    return { error: message };
+  }
+});
+
+app.post("/v1/internal/resolution-collection-failures", async (request, reply) => {
+  const body = request.body as {
+    market_id?: string;
+    collector_agent_id?: string;
+    failure_kind?: "source_fetch" | "schema_validation" | "decision_rule" | "unknown";
+    reason?: string;
+  };
+  if (!body.market_id || !body.collector_agent_id || !body.failure_kind || !body.reason) {
+    reply.code(400);
+    return { error: "invalid_internal_resolution_collection_failure_request" };
+  }
+
+  try {
+    const resolutionCase = await reportCollectionFailure(
+      body.market_id,
+      body.collector_agent_id,
+      body.failure_kind,
+      body.reason,
+    );
+    return { status: resolutionCase.status };
+  } catch (error) {
+    reply.code(422);
+    return { error: String(error) };
   }
 });
 

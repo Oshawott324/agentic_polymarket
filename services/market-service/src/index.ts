@@ -6,7 +6,7 @@ import {
   toIsoTimestamp,
   toNumberOrNull,
 } from "@automakit/persistence";
-import type { ResolutionKind, ResolutionSpec } from "@automakit/sdk-types";
+import { type ResolutionKind, type ResolutionSpec, validateResolutionSpec } from "@automakit/sdk-types";
 import { randomUUID } from "node:crypto";
 import type { PoolClient } from "pg";
 
@@ -48,6 +48,18 @@ type MarketRow = {
   liquidity_score: unknown;
   outcomes: unknown;
   rules: string;
+};
+
+type ResolutionCandidateRow = {
+  id: string;
+  title: string;
+  status: MarketRecord["status"];
+  category: string;
+  close_time: unknown;
+  resolution_spec: unknown;
+  resolution_case_status: string | null;
+  evidence_count: unknown;
+  distinct_collector_count: unknown;
 };
 
 const port = Number(process.env.MARKET_SERVICE_PORT ?? 4003);
@@ -211,6 +223,79 @@ app.get("/v1/markets", async () => {
     items: result.rows.map(({ rules, ...market }) => mapMarketRow({ ...market, rules })),
     next_cursor: null,
   };
+});
+
+app.get("/v1/internal/markets/resolution-candidates", async (request) => {
+  const limit = Math.max(
+    1,
+    Math.min(100, Number((request.query as { limit?: string }).limit ?? "20") || 20),
+  );
+
+  const result = await pool.query<ResolutionCandidateRow>(
+    `
+      SELECT
+        markets.id,
+        markets.title,
+        markets.status,
+        markets.category,
+        markets.close_time,
+        markets.resolution_spec,
+        resolution_cases.status AS resolution_case_status,
+        COUNT(resolution_evidence.id) AS evidence_count,
+        COUNT(DISTINCT resolution_evidence.submitter_agent_id) AS distinct_collector_count
+      FROM markets
+      LEFT JOIN resolution_cases ON resolution_cases.market_id = markets.id
+      LEFT JOIN resolution_evidence ON resolution_evidence.market_id = markets.id
+      WHERE markets.close_time <= NOW()
+        AND markets.status IN ('open', 'closed')
+      GROUP BY
+        markets.id,
+        markets.title,
+        markets.status,
+        markets.category,
+        markets.close_time,
+        markets.resolution_spec,
+        resolution_cases.status
+      ORDER BY markets.close_time ASC, markets.id ASC
+      LIMIT $1
+    `,
+    [limit * 4],
+  );
+
+  const items = result.rows.flatMap((row) => {
+    const validation = validateResolutionSpec(parseJsonField<ResolutionSpec>(row.resolution_spec));
+    const evidenceCount = Number(row.evidence_count);
+    const distinctCollectorCount = Number(row.distinct_collector_count);
+
+    if (!validation.ok) {
+      return [];
+    }
+
+    if (row.resolution_case_status === "finalized" || row.resolution_case_status === "quarantined") {
+      return [];
+    }
+
+    return [
+      {
+        market_id: row.id,
+        title: row.title,
+        status: row.status,
+        category: row.category,
+        close_time: toIsoTimestamp(row.close_time),
+        resolution_spec: validation.spec,
+        evidence_count: evidenceCount,
+        distinct_collector_count: distinctCollectorCount,
+      },
+    ];
+  }).filter((candidate) => {
+    const needsObservation =
+      candidate.evidence_count < candidate.resolution_spec.quorum_rule.min_observations ||
+      candidate.distinct_collector_count < candidate.resolution_spec.quorum_rule.min_distinct_collectors;
+
+    return needsObservation;
+  }).slice(0, limit);
+
+  return { items };
 });
 
 app.post("/v1/internal/markets", async (request, reply) => {
@@ -401,6 +486,69 @@ app.get("/v1/markets/:marketId", async (request, reply) => {
     },
     orderbook: await getOrderbookSnapshot(pool, market.id),
   };
+});
+
+app.post("/v1/internal/markets/:marketId/status", async (request, reply) => {
+  const marketId = (request.params as { marketId: string }).marketId;
+  const body = request.body as {
+    status?: MarketRecord["status"];
+  };
+
+  if (!body.status) {
+    reply.code(400);
+    return { error: "missing_market_status" };
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const result = await client.query<MarketRow>(
+      `
+        UPDATE markets
+        SET status = $2
+        WHERE id = $1
+        RETURNING
+          id,
+          proposal_id,
+          event_id,
+          title,
+          subtitle,
+          status,
+          category,
+          close_time,
+          resolution_spec,
+          resolution_source,
+          resolution_kind,
+          resolution_metadata,
+          last_traded_price_yes,
+          volume_24h,
+          liquidity_score,
+          outcomes,
+          rules
+      `,
+      [marketId, body.status],
+    );
+
+    if (!result.rowCount) {
+      await client.query("ROLLBACK");
+      reply.code(404);
+      return { error: "market_not_found" };
+    }
+
+    const market = mapMarketRow(result.rows[0]);
+    await appendStreamEvent(client, {
+      channel: "market.snapshot",
+      market_id: market.id,
+      payload: market,
+    });
+    await client.query("COMMIT");
+    return market;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
 });
 
 async function start() {

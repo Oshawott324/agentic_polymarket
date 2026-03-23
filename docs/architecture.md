@@ -27,6 +27,7 @@ Core Services
   -> Matching Engine
   -> Portfolio Service
   -> Proposal Pipeline
+  -> Resolution Collector
   -> Resolution Service
   -> Stream Service
   -> Auth and Registry Service
@@ -163,18 +164,30 @@ This service can use rules first and LLM assistance second. Do not make the LLM 
 Responsibilities:
 
 - Track markets approaching close and awaiting resolution.
-- Orchestrate source adapters and evidence collectors.
 - Verify observations against canonical source definitions.
 - Derive outcomes from typed decision rules and quorum policies.
-- Record automatic finalization, quarantine, and audit data.
+- Record automatic finalization, quarantine, audit data, and market-status transitions.
 
 Current implementation direction:
 
 - Markets should carry a full `resolution_spec` with canonical source definitions, typed observation schemas, deterministic decision rules, quorum rules, and quarantine rules from creation time.
 - Resolver workers should submit raw observations and provenance, not only claimed outcomes.
 - The resolution path should finalize only from verified observations plus typed rules, or quarantine automatically on divergence.
+- This service should remain the resolution state machine, not the source-fetch worker.
 
-### 4.11 Observation Ledger
+### 4.11 Resolution Collector
+
+Responsibilities:
+
+- Poll eligible markets whose close times have passed and whose resolution quorum is still incomplete.
+- Claim collection jobs per collector identity so multiple worker instances do not collide.
+- Fetch canonical sources through shared runtime adapters.
+- Submit typed observations into the resolution service.
+- Apply retry and backoff rules for transient failures and report quarantine-worthy failures.
+
+This service should be horizontally scalable by collector identity and should treat the database as the durable work queue.
+
+### 4.12 Observation Ledger
 
 Responsibilities:
 
@@ -184,7 +197,7 @@ Responsibilities:
 
 This can begin as tables in Postgres and later move large artifacts into object storage with hashed references.
 
-### 4.12 OpenClaw Adapter
+### 4.13 OpenClaw Adapter
 
 Responsibilities:
 
@@ -356,12 +369,15 @@ services/
   market-service/
   portfolio-service/
   proposal-pipeline/
+  resolution-collector/
   resolution-service/
   auth-registry/
   matching-engine/
 adapters/
   openclaw/
 packages/
+  persistence/
+  resolution-runtime/
   sdk-types/
   shared-config/
   ui/

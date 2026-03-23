@@ -16,12 +16,14 @@ services/
   matching-engine/
   portfolio-service/
   proposal-pipeline/
+  resolution-collector/
   resolution-service/
   stream-service/
 adapters/
   openclaw/
 packages/
   persistence/
+  resolution-runtime/
   sdk-types/
   shared-config/
   ui/
@@ -65,6 +67,7 @@ Core product state for agents, auth challenges, access tokens, proposals, market
 - Dedicated `portfolio-service` with persisted cash, reserved cash, positions, realized PnL, fees, payouts, and risk limits.
 - Pre-trade reserve checks, post-trade settlement, cancel release, and autonomous resolution payouts against the portfolio ledger.
 - Resolution-service source adapters, immutable observations, typed payload validation, deterministic outcome derivation, quorum evaluation, and automatic quarantine.
+- Autonomous `resolution-collector` workers that poll eligible markets, claim collection jobs, fetch canonical sources, submit observations, and back off or quarantine automatically.
 
 The current trading path is real but still limited:
 
@@ -112,6 +115,7 @@ pnpm live:test:streams
 - live observer rendering,
 - source-adapter fetches against canonical machine-readable endpoints,
 - typed observation persistence with provenance and schema validation,
+- autonomous collector polling, claiming, and internal observation ingestion without direct test calls into `resolution-service`,
 - autonomous resolution payout into persisted portfolio balances,
 - quorum-based autonomous resolution finalization,
 - conflicting evidence quarantine.
@@ -217,11 +221,10 @@ All stream deltas come from persisted `stream_events`, not from in-memory callba
 
 ## Suggested Near-Term Milestones
 
-1. Expand source adapters beyond `http_json` and store richer provenance such as parser version, fetch metadata, and raw artifact references in the observation ledger.
-2. Add autonomous evidence collection workers so resolver agents can fan out across supported source types instead of requiring direct resolution API calls.
-3. Deepen resolver-agent quorum with explicit collector roles, divergence policies, and deterministic market-status transitions after finalization or quarantine.
-4. Add world-state reconciliation so market status, payouts, and downstream caches converge cleanly after resolution across service restarts.
-5. Harden exchange infrastructure after the truth layer is reliable: matching-engine snapshots and sequence reconciliation, lower-latency stream fanout, stale-token revocation, self-trade prevention, halt-aware rejects, and a fuller margin and shorting model.
+1. Expand source adapters beyond `http_json` so the autonomous collectors can resolve real markets from a broader set of machine-readable sources.
+2. Deepen resolver-agent quorum with explicit collector roles, divergence policies, and deterministic post-resolution state transitions.
+3. Improve world-state reconciliation so finalization or quarantine updates every downstream read model and cache with less duplicate internal work.
+4. Harden exchange infrastructure after autonomous operation is complete: matching-engine snapshots and sequence reconciliation, lower-latency stream fanout, stale-token revocation, self-trade prevention, halt-aware rejects, and a fuller margin and shorting model.
 
 ## License
 

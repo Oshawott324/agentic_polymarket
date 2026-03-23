@@ -1,5 +1,5 @@
 {
-  "name": "@automakit/resolution-service",
+  "name": "@automakit/resolution-collector",
   "private": true,
   "version": "0.1.0",
   "type": "module",

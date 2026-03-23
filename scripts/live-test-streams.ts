@@ -238,6 +238,8 @@ async function main() {
   const databasePort = await reservePort();
   const matchingEnginePort = await reservePort();
   const sourcePort = await reservePort();
+  const collectorAlphaPort = await reservePort();
+  const collectorBetaPort = await reservePort();
   const databaseDirectory = await mkdtemp(path.join(os.tmpdir(), "automakit-streams-"));
   const databaseUrl = `postgres://postgres:postgres@127.0.0.1:${databasePort}/postgres`;
   const repoRoot = process.cwd();
@@ -370,7 +372,7 @@ async function main() {
         proposal_id: "stream-flow-market",
         title: "Will BTC close above $120k on December 31, 2026?",
         category: "crypto",
-        close_time: "2026-12-31T23:59:59Z",
+        close_time: new Date(Date.now() - 60_000).toISOString(),
         resolution_criteria: "Resolve YES if BTC closes above 120,000 USD by the close time.",
         resolution_spec: {
           kind: "price_threshold",
@@ -419,8 +421,6 @@ async function main() {
 
     const maker = await createAndAuthenticateAgent("stream-maker");
     const taker = await createAndAuthenticateAgent("stream-taker");
-    const resolverA = await createAndAuthenticateAgent("stream-resolver-a");
-    const resolverB = await createAndAuthenticateAgent("stream-resolver-b");
 
     const mintResponse = await fetch("http://127.0.0.1:4004/v1/internal/markets/mint-complete-set", {
       method: "POST",
@@ -516,33 +516,41 @@ async function main() {
       throw new Error(`Taker order failed with ${takerOrderResponse.status}`);
     }
 
-    const evidenceOne = await fetch("http://127.0.0.1:4006/v1/resolution-collect", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-agent-id": resolverA.id,
-      },
-      body: JSON.stringify({
-        market_id: market.id,
-      }),
-    });
-    const evidenceTwo = await fetch("http://127.0.0.1:4006/v1/resolution-collect", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-agent-id": resolverB.id,
-      },
-      body: JSON.stringify({
-        market_id: market.id,
-      }),
-    });
-    if (!evidenceOne.ok || !evidenceTwo.ok) {
-      const firstBody = await evidenceOne.text();
-      const secondBody = await evidenceTwo.text();
-      throw new Error(
-        `Resolution collection failed: ${evidenceOne.status}/${evidenceTwo.status} bodies=${firstBody} | ${secondBody}`,
-      );
-    }
+    processes.push(
+      startProcess(
+        "resolution-collector-alpha",
+        process.execPath,
+        ["dist/index.js"],
+        {
+          DATABASE_URL: databaseUrl,
+          MARKET_SERVICE_URL: "http://127.0.0.1:4003",
+          RESOLUTION_SERVICE_URL: "http://127.0.0.1:4006",
+          COLLECTOR_AGENT_ID: "resolver-alpha",
+          RESOLUTION_COLLECTOR_PORT: String(collectorAlphaPort),
+          RESOLUTION_COLLECTOR_INTERVAL_MS: "500",
+        },
+        path.join(repoRoot, "services", "resolution-collector"),
+      ),
+    );
+    processes.push(
+      startProcess(
+        "resolution-collector-beta",
+        process.execPath,
+        ["dist/index.js"],
+        {
+          DATABASE_URL: databaseUrl,
+          MARKET_SERVICE_URL: "http://127.0.0.1:4003",
+          RESOLUTION_SERVICE_URL: "http://127.0.0.1:4006",
+          COLLECTOR_AGENT_ID: "resolver-beta",
+          RESOLUTION_COLLECTOR_PORT: String(collectorBetaPort),
+          RESOLUTION_COLLECTOR_INTERVAL_MS: "500",
+        },
+        path.join(repoRoot, "services", "resolution-collector"),
+      ),
+    );
+
+    await waitForJson(`http://127.0.0.1:${collectorAlphaPort}/health`);
+    await waitForJson(`http://127.0.0.1:${collectorBetaPort}/health`);
 
     const replayConnection = await openStreamSocket(maker.token);
     replaySocket = replayConnection.socket;
@@ -551,7 +559,14 @@ async function main() {
     replaySocket.send(
       JSON.stringify({
         type: "subscribe",
-        channels: ["trade.fill", "order.update", "portfolio.update", "orderbook.delta", "resolution.update"],
+        channels: [
+          "trade.fill",
+          "order.update",
+          "portfolio.update",
+          "orderbook.delta",
+          "resolution.update",
+          "market.snapshot",
+        ],
         market_id: market.id,
         from_sequence: lastSeenSequence,
         snapshot: false,
@@ -564,6 +579,14 @@ async function main() {
         replayMessages.some((message) => message.type === "event" && message.channel === "order.update") &&
         replayMessages.some((message) => message.type === "event" && message.channel === "portfolio.update") &&
         replayMessages.some((message) => message.type === "event" && message.channel === "orderbook.delta") &&
+        replayMessages.some(
+          (message) =>
+            message.type === "event" &&
+            message.channel === "market.snapshot" &&
+            typeof message.payload === "object" &&
+            message.payload !== null &&
+            (message.payload as { status?: string }).status === "resolved",
+        ) &&
         replayMessages.some(
           (message) =>
             message.type === "event" &&
