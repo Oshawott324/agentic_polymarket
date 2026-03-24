@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import hashlib
 import json
 import os
+import random
 import shlex
+import sqlite3
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -49,6 +52,24 @@ class LlmConfig:
     timeout_seconds: float
 
 
+@dataclass(slots=True)
+class OasisNativeConfig:
+    enabled: bool
+    platform: str
+    rounds: int
+    min_active_agents: int
+    max_active_agents: int
+    semaphore: int
+    random_seed: Optional[int]
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 class CamelOasisAdapter:
     """
     Primary mode:
@@ -59,6 +80,19 @@ class CamelOasisAdapter:
 
     def __init__(self) -> None:
         self.runner_cmd = os.getenv("CAMEL_OASIS_RUNNER_CMD", "").strip()
+        platform = os.getenv("SIM_RUNTIME_CAMEL_OASIS_PLATFORM", "twitter").strip().lower()
+        if platform not in {"twitter", "reddit"}:
+            platform = "twitter"
+        seed_raw = os.getenv("SIM_RUNTIME_CAMEL_OASIS_RANDOM_SEED", "").strip()
+        self.oasis_native = OasisNativeConfig(
+            enabled=env_bool("SIM_RUNTIME_ENABLE_CAMEL_OASIS", False),
+            platform=platform,
+            rounds=max(1, int(os.getenv("SIM_RUNTIME_CAMEL_OASIS_ROUNDS", "3"))),
+            min_active_agents=max(1, int(os.getenv("SIM_RUNTIME_CAMEL_OASIS_MIN_ACTIVE_AGENTS", "2"))),
+            max_active_agents=max(1, int(os.getenv("SIM_RUNTIME_CAMEL_OASIS_MAX_ACTIVE_AGENTS", "8"))),
+            semaphore=max(1, int(os.getenv("SIM_RUNTIME_CAMEL_OASIS_SEMAPHORE", "16"))),
+            random_seed=int(seed_raw) if seed_raw else None,
+        )
         self.allow_direct_llm = os.getenv("SIM_RUNTIME_ALLOW_DIRECT_LLM", "true").lower() in (
             "1",
             "true",
@@ -84,10 +118,149 @@ class CamelOasisAdapter:
     ) -> SimulationRunResultV1:
         if self.runner_cmd:
             return await self._execute_runner_mode(request, progress)
+        if self.oasis_native.enabled:
+            return await self._execute_native_oasis_mode(request, progress)
         if self.allow_direct_llm:
             return await self._execute_direct_mode(request, progress)
         raise RuntimeError(
-            "simulation_runtime_not_configured: set CAMEL_OASIS_RUNNER_CMD or SIM_RUNTIME_ALLOW_DIRECT_LLM=true"
+            "simulation_runtime_not_configured: set CAMEL_OASIS_RUNNER_CMD, "
+            "or SIM_RUNTIME_ENABLE_CAMEL_OASIS=true, "
+            "or SIM_RUNTIME_ALLOW_DIRECT_LLM=true"
+        )
+
+    async def _execute_native_oasis_mode(
+        self,
+        request: SimulationRunRequestV1,
+        progress: ProgressCallback,
+    ) -> SimulationRunResultV1:
+        if self.llm is None:
+            raise RuntimeError("camel_oasis_native_requires_llm_config")
+
+        try:
+            from camel.models import ModelFactory
+            from camel.types import ModelPlatformType
+            import oasis
+            from oasis import LLMAction
+            from oasis import generate_reddit_agent_graph, generate_twitter_agent_graph
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"camel_oasis_import_failed:{exc}") from exc
+
+        if self.oasis_native.random_seed is not None:
+            random.seed(self.oasis_native.random_seed)
+
+        roles = self._collect_runtime_roles(request)
+        simulation_summary: Dict[str, Any] = {
+            "platform": self.oasis_native.platform,
+            "rounds": self.oasis_native.rounds,
+            "active_agent_counts": [],
+            "trace_rows": 0,
+            "trace_actions": {},
+            "top_subjects": [],
+        }
+
+        with tempfile.TemporaryDirectory(prefix="automakit-camel-oasis-") as temp_dir:
+            profile_path = self._write_profiles(temp_dir=temp_dir, roles=roles)
+            database_path = os.path.join(temp_dir, f"{self.oasis_native.platform}.db")
+
+            os.environ["OPENAI_API_KEY"] = self.llm.api_key
+            if self.llm.base_url:
+                os.environ["OPENAI_API_BASE_URL"] = self.llm.base_url
+
+            model = ModelFactory.create(
+                model_platform=ModelPlatformType.OPENAI,
+                model_type=self.llm.model,
+            )
+
+            await progress("world_model", 5)
+            if self.oasis_native.platform == "reddit":
+                agent_graph = await generate_reddit_agent_graph(
+                    profile_path=profile_path,
+                    model=model,
+                )
+                platform_value = oasis.DefaultPlatformType.REDDIT
+            else:
+                agent_graph = await generate_twitter_agent_graph(
+                    profile_path=profile_path,
+                    model=model,
+                )
+                platform_value = oasis.DefaultPlatformType.TWITTER
+
+            env = oasis.make(
+                agent_graph=agent_graph,
+                platform=platform_value,
+                database_path=database_path,
+                semaphore=self.oasis_native.semaphore,
+            )
+            await env.reset()
+
+            round_subjects = self._top_subjects_from_signals(request, limit=5)
+            for round_index in range(self.oasis_native.rounds):
+                selected_ids = self._select_active_ids(len(roles))
+                simulation_summary["active_agent_counts"].append(len(selected_ids))
+                if selected_ids:
+                    actions: Dict[Any, Any] = {}
+                    for agent_id in selected_ids:
+                        agent = env.agent_graph.get_agent(agent_id)
+                        actions[agent] = LLMAction()
+                    await env.step(actions)
+                progress_value = 5 + (65 * (round_index + 1) / max(self.oasis_native.rounds, 1))
+                await progress("scenario", progress_value)
+
+            simulation_summary["trace_rows"], simulation_summary["trace_actions"] = self._read_trace_stats(database_path)
+            simulation_summary["top_subjects"] = round_subjects
+
+        world_roles = request.agent_roles.world_model or ["world-model-alpha"]
+        scenario_roles = request.agent_roles.scenario or ["scenario-base"]
+        synthesis_roles = request.agent_roles.synthesis or ["synthesis-core"]
+
+        world_state_proposals: List[Dict[str, Any]] = []
+        direct_hypotheses: List[Dict[str, Any]] = []
+        scenario_path_proposals: List[Dict[str, Any]] = []
+        synthesized_beliefs: List[Dict[str, Any]] = []
+
+        await progress("world_model", 72)
+        for idx, agent_id in enumerate(world_roles, start=1):
+            state, hypotheses = await self._run_world_model_agent(
+                request=request,
+                agent_id=agent_id,
+                simulation_summary=simulation_summary,
+            )
+            world_state_proposals.append(state)
+            direct_hypotheses.extend(hypotheses)
+            await progress("world_model", 72 + 8 * idx / max(len(world_roles), 1))
+
+        await progress("scenario", 82)
+        for idx, agent_id in enumerate(scenario_roles, start=1):
+            scenario = await self._run_scenario_agent(
+                request=request,
+                agent_id=agent_id,
+                direct_hypotheses=direct_hypotheses,
+            )
+            scenario_path_proposals.append(scenario)
+            await progress("scenario", 82 + 8 * idx / max(len(scenario_roles), 1))
+
+        await progress("synthesis", 90)
+        for idx, agent_id in enumerate(synthesis_roles, start=1):
+            beliefs = await self._run_synthesis_agent(
+                request=request,
+                agent_id=agent_id,
+                direct_hypotheses=direct_hypotheses,
+                scenario_paths=scenario_path_proposals,
+            )
+            synthesized_beliefs.extend(beliefs)
+            await progress("synthesis", 90 + 10 * idx / max(len(synthesis_roles), 1))
+
+        return SimulationRunResultV1(
+            contract_version="sim-runtime.v1",
+            run_id=request.run_id,
+            runtime_run_id=f"camel-oasis-{request.run_id}",
+            completed_at=now_iso(),
+            outputs=SimulationOutputsV1(
+                world_state_proposals=world_state_proposals,
+                direct_hypotheses=direct_hypotheses,
+                scenario_path_proposals=scenario_path_proposals,
+                synthesized_beliefs=synthesized_beliefs,
+            ),
         )
 
     async def _execute_runner_mode(
@@ -194,6 +367,7 @@ class CamelOasisAdapter:
         self,
         request: SimulationRunRequestV1,
         agent_id: str,
+        simulation_summary: Optional[Dict[str, Any]] = None,
     ) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
         signal_ids = [signal.id for signal in request.signals]
         top_signal = request.signals[-1] if request.signals else None
@@ -207,6 +381,7 @@ class CamelOasisAdapter:
                 "run_id": request.run_id,
                 "agent_id": agent_id,
                 "signals": [signal.model_dump() for signal in request.signals],
+                "simulation_summary": simulation_summary or {},
             },
         )
 
@@ -217,6 +392,13 @@ class CamelOasisAdapter:
             regime_labels = ["mixed_regime"]
 
         reasoning_summary = f"{agent_id} processed {len(request.signals)} signals."
+        if simulation_summary:
+            trace_rows = int(simulation_summary.get("trace_rows", 0))
+            rounds = int(simulation_summary.get("rounds", 0))
+            reasoning_summary = (
+                f"{agent_id} processed {len(request.signals)} signals after "
+                f"{rounds} simulation rounds with {trace_rows} trace events."
+            )
         if isinstance(llm_payload, dict) and isinstance(llm_payload.get("reasoning_summary"), str):
             reasoning_summary = llm_payload["reasoning_summary"][:500]
 
@@ -641,3 +823,117 @@ class CamelOasisAdapter:
             return host[4:] if host.startswith("www.") else host
         except Exception:
             return "unknown.local"
+
+    def _collect_runtime_roles(self, request: SimulationRunRequestV1) -> List[str]:
+        ordered: List[str] = []
+        seen: set[str] = set()
+        for role in (
+            request.agent_roles.world_model
+            + request.agent_roles.scenario
+            + request.agent_roles.synthesis
+        ):
+            key = str(role).strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            ordered.append(key)
+        if not ordered:
+            ordered = [
+                "world-model-alpha",
+                "world-model-beta",
+                "scenario-base",
+                "scenario-bear",
+                "synthesis-core",
+            ]
+        return ordered
+
+    def _write_profiles(self, temp_dir: str, roles: Sequence[str]) -> str:
+        if self.oasis_native.platform == "reddit":
+            return self._write_reddit_profiles(temp_dir, roles)
+        return self._write_twitter_profiles(temp_dir, roles)
+
+    def _write_twitter_profiles(self, temp_dir: str, roles: Sequence[str]) -> str:
+        path = os.path.join(temp_dir, "oasis_profiles_twitter.csv")
+        with open(path, "w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["user_id", "name", "username", "user_char", "description"])
+            for idx, role in enumerate(roles):
+                persona = (
+                    f"{role} is an autonomous forecasting participant focused on extracting "
+                    "causal signals, uncertainty, and market-facing implications."
+                )
+                writer.writerow(
+                    [
+                        idx,
+                        role.replace("-", " ").title(),
+                        role.replace("-", "_"),
+                        persona,
+                        f"{role} simulation participant",
+                    ]
+                )
+        return path
+
+    def _write_reddit_profiles(self, temp_dir: str, roles: Sequence[str]) -> str:
+        path = os.path.join(temp_dir, "oasis_profiles_reddit.json")
+        payload: List[Dict[str, Any]] = []
+        for idx, role in enumerate(roles):
+            payload.append(
+                {
+                    "user_id": idx,
+                    "username": role.replace("-", "_"),
+                    "name": role.replace("-", " ").title(),
+                    "bio": f"{role} monitors macro and market narratives.",
+                    "persona": (
+                        "Autonomous agent that scans narratives, disputes assumptions, "
+                        "and contributes probabilistic hypotheses."
+                    ),
+                    "karma": 500 + idx * 17,
+                    "created_at": utc_now().strftime("%Y-%m-%d"),
+                    "age": 30,
+                    "gender": "other",
+                    "mbti": "INTJ",
+                    "country": "global",
+                }
+            )
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+        return path
+
+    def _select_active_ids(self, population_size: int) -> List[int]:
+        if population_size <= 0:
+            return []
+        minimum = min(self.oasis_native.min_active_agents, population_size)
+        maximum = min(max(minimum, self.oasis_native.max_active_agents), population_size)
+        target = random.randint(minimum, maximum)
+        return random.sample(list(range(population_size)), target)
+
+    def _read_trace_stats(self, database_path: str) -> tuple[int, Dict[str, int]]:
+        if not os.path.exists(database_path):
+            return 0, {}
+        row_count = 0
+        action_counts: Dict[str, int] = {}
+        try:
+            connection = sqlite3.connect(database_path)
+            cursor = connection.cursor()
+            cursor.execute("SELECT COUNT(*) FROM trace")
+            found = cursor.fetchone()
+            if found and isinstance(found[0], int):
+                row_count = int(found[0])
+            cursor.execute("SELECT action, COUNT(*) FROM trace GROUP BY action")
+            for action, count in cursor.fetchall():
+                action_counts[str(action)] = int(count)
+            connection.close()
+        except Exception:
+            return row_count, action_counts
+        return row_count, action_counts
+
+    def _top_subjects_from_signals(self, request: SimulationRunRequestV1, limit: int = 5) -> List[str]:
+        subjects: List[str] = []
+        for signal in request.signals:
+            raw = signal.payload.get("asset_symbol") or signal.payload.get("institution") or signal.title
+            value = str(raw).strip()
+            if value and value not in subjects:
+                subjects.append(value)
+            if len(subjects) >= limit:
+                break
+        return subjects

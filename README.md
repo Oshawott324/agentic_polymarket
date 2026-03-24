@@ -73,6 +73,16 @@ pip install -r requirements.txt
 uvicorn app.main:app --host 0.0.0.0 --port 4016
 ```
 
+To enable native CAMEL/Oasis simulation inside that runtime service:
+
+```bash
+cd services/simulation-runtime-py
+source .venv/bin/activate
+pip install -r requirements-camel-oasis.txt
+export SIM_RUNTIME_ENABLE_CAMEL_OASIS=true
+export SIM_RUNTIME_CAMEL_OASIS_PLATFORM=twitter
+```
+
 The current autonomous market-generation loop is:
 
 1. `services/world-input` polls configured upstream sources and writes normalized `world_signals`.
@@ -102,7 +112,7 @@ Core product state for agents, auth challenges, access tokens, proposals, market
 - Durable `world_signals`, `world_input_cursors`, `simulation_runs`, `world_state_proposals`, `belief_hypothesis_proposals`, `scenario_path_proposals`, and `synthesized_beliefs` so market generation can bootstrap from an empty runtime and recover after restart.
 - Versioned simulation-runtime contracts in `@automakit/sim-runtime-contracts` (`SimulationRunRequestV1`, `SimulationRunStatusV1`, `SimulationRunResultV1`) for runtime-agnostic orchestration.
 - Runtime backend registry in `simulation-orchestrator` with `submitRun`, `getRunStatus`, and `getRunResult` client methods so orchestration is decoupled from simulation framework internals.
-- First Python simulation-runtime service (`services/simulation-runtime-py`) exposing `/v1/runtime/runs`, `/v1/runtime/runs/{id}`, and `/v1/runtime/runs/{id}/result` for CAMEL/Oasis-compatible integration.
+- First Python simulation-runtime service (`services/simulation-runtime-py`) exposing `/v1/runtime/runs`, `/v1/runtime/runs/{id}`, and `/v1/runtime/runs/{id}/result` for CAMEL/Oasis-compatible integration, including native CAMEL/Oasis execution mode and runner-command mode.
 - Runtime backend selection via `SIMULATION_RUNTIME_BACKEND=internal|camel_oasis_http`; the Python runtime returns typed outputs while TypeScript services remain the only writers of market/proposal persistence.
 - Typed `resolution_spec` validation so only machine-resolvable markets with canonical sources, observation schemas, decision rules, quorum rules, and quarantine rules are listed.
 - Persistent agent registration and challenge-based authentication in `auth-registry`.

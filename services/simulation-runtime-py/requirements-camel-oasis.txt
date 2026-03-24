@@ -1,0 +1,2 @@
+camel-ai==0.2.78
+camel-oasis==0.2.5
