@@ -98,7 +98,7 @@ Responsibilities:
 
 This service should not decide beliefs. It should coordinate agents that do.
 
-### 5.1A `services/simulation-runtime-py` (planned)
+### 5.1A `services/simulation-runtime-py`
 
 Responsibilities:
 
@@ -469,11 +469,13 @@ Implemented:
 8. The deprecated single-path enrichment path and `world_hypotheses` persistence path have been removed from the active runtime design.
 9. `world-model`, `scenario-agent`, and `synthesis-agent` run in LLM mode by default using OpenAI-compatible settings.
 10. deterministic contract validation remains in shared TypeScript packages; simulation runtime language can vary.
+11. `@automakit/sim-runtime-contracts` defines versioned runtime-agnostic schemas for request, status, and result payloads.
+12. `simulation-orchestrator` now uses a runtime client interface (`submitRun`, `getRunStatus`, `getRunResult`) and a backend registry (`SIMULATION_RUNTIME_BACKEND`).
+13. `services/simulation-runtime-py` implements `/v1/runtime/runs`, `/v1/runtime/runs/{id}`, and `/v1/runtime/runs/{id}/result` and returns typed world/scenario/synthesis outputs without writing market tables directly.
 
 Remaining focus:
 
 1. broader source-adapter coverage including social ingestion,
 2. dedicated approval-agent quorum stage before proposal publication,
-3. Python simulation runtime boundary for CAMEL/Oasis-compatible workers,
-4. platform-owned liquidity bootstrap,
-5. further exchange hardening beyond replay-based recovery.
+3. platform-owned liquidity bootstrap,
+4. further exchange hardening beyond replay-based recovery.

@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@automakit/persistence": "workspace:*",
+    "@automakit/sim-runtime-contracts": "workspace:*",
     "@automakit/world-sim": "workspace:*",
     "fastify": "^5.3.2"
   }

@@ -56,7 +56,7 @@ Outcome:
 
 Status:
 
-- Planned next tranche. Current repo has autonomous simulation and publication, but no dedicated approval-agent quorum service yet.
+- In progress. Current repo now has versioned simulation-runtime contracts, a runtime client interface in `simulation-orchestrator`, and a Python simulation-runtime service; approval-agent quorum is still pending.
 
 Core capabilities:
 
@@ -78,6 +78,12 @@ Dependency gates (must pass in this exact order):
 - Pass condition: `simulation-orchestrator` can invoke the simulation runtime over versioned contracts and persist run outputs deterministically.
 3. Agent-quorum gate
 - Pass condition: approval agents evaluate synthesized beliefs and only quorum-approved beliefs proceed to proposal publication.
+
+Current gate status:
+
+- Data-input gate: pending.
+- Simulation-engine gate: implemented (first cut) with `@automakit/sim-runtime-contracts`, runtime backend registry, and `services/simulation-runtime-py`.
+- Agent-quorum gate: pending.
 
 Execution rule:
 

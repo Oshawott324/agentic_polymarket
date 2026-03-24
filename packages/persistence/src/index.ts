@@ -114,6 +114,22 @@ export async function ensureCoreSchema(pool: Pool) {
     CREATE INDEX IF NOT EXISTS idx_simulation_runs_status_started
       ON simulation_runs (status, started_at DESC);
 
+    CREATE TABLE IF NOT EXISTS simulation_runtime_runs (
+      run_id TEXT PRIMARY KEY REFERENCES simulation_runs(id) ON DELETE CASCADE,
+      backend TEXT NOT NULL,
+      contract_version TEXT NOT NULL,
+      runtime_run_id TEXT NOT NULL UNIQUE,
+      status TEXT NOT NULL,
+      last_error TEXT,
+      last_checked_at TIMESTAMPTZ NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL,
+      completed_at TIMESTAMPTZ
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_simulation_runtime_runs_status_checked
+      ON simulation_runtime_runs (status, last_checked_at ASC);
+
     CREATE TABLE IF NOT EXISTS world_state_proposals (
       id TEXT PRIMARY KEY,
       run_id TEXT NOT NULL REFERENCES simulation_runs(id) ON DELETE CASCADE,

@@ -272,11 +272,13 @@ Responsibilities:
 - Allow Python-based CAMEL/Oasis simulation workers to run without moving core platform state management out of TypeScript services.
 - Accept run payloads from `simulation-orchestrator` and return validated world-state, scenario, and belief artifacts.
 - Version request and response schemas so runtime upgrades do not silently break orchestration.
+- Keep market/proposal persistence ownership in TypeScript services; runtime workers must not write exchange state directly.
 
 Implementation direction:
 
 - Current runtime workers are TypeScript services (`world-model`, `scenario-agent`, `synthesis-agent`).
-- Next step is a dedicated `services/simulation-runtime-py` boundary with JSON-over-HTTP or queue-based contracts.
+- `services/simulation-runtime-py` now provides the first external runtime boundary over HTTP with versioned contracts.
+- `simulation-orchestrator` now uses a backend registry and runtime client interface (`submitRun`, `getRunStatus`, `getRunResult`) instead of framework-specific bindings.
 - Deterministic checks remain in platform services and shared schema packages.
 
 ### 4.12 World-Model Agents
@@ -585,13 +587,14 @@ services/
   synthesis-agent/
   world-input/
   world-model/
-  simulation-runtime-py/  # planned boundary
+  simulation-runtime-py/
 adapters/
   openclaw/
 packages/
   agent-llm/
   persistence/
   resolution-runtime/
+  sim-runtime-contracts/
   sdk-types/
   shared-config/
   ui/
