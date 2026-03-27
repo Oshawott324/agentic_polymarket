@@ -1,4 +1,5 @@
 import Fastify from "fastify";
+import { setTimeout as delay } from "node:timers/promises";
 import { createDatabasePool, ensureCoreSchema, parseJsonField, toIsoTimestamp } from "@automakit/persistence";
 import type { ResolutionSpec } from "@automakit/sdk-types";
 import {
@@ -12,6 +13,7 @@ type SynthesizedBeliefRow = {
   id: string;
   run_id: string;
   agent_id: string;
+  approval_case_id: string;
   belief_dedupe_key: string;
   parent_hypothesis_ids: unknown;
   agreement_score: unknown;
@@ -24,6 +26,10 @@ type SynthesizedBeliefRow = {
   linked_proposal_id: string | null;
   created_at: unknown;
   updated_at: unknown;
+};
+
+type ApprovedSynthesizedBelief = SynthesizedBelief & {
+  approval_case_id: string;
 };
 
 const port = Number(process.env.PROPOSAL_AGENT_PORT ?? 4012);
@@ -54,6 +60,13 @@ function mapSynthesizedBeliefRow(row: SynthesizedBeliefRow): SynthesizedBelief {
     linked_proposal_id: row.linked_proposal_id,
     created_at: toIsoTimestamp(row.created_at),
     updated_at: toIsoTimestamp(row.updated_at),
+  };
+}
+
+function mapApprovedSynthesizedBeliefRow(row: SynthesizedBeliefRow): ApprovedSynthesizedBelief {
+  return {
+    ...mapSynthesizedBeliefRow(row),
+    approval_case_id: row.approval_case_id,
   };
 }
 
@@ -155,19 +168,26 @@ function buildProposalCandidate(belief: SynthesizedBelief) {
   }
 }
 
-async function fetchNewBeliefs(limit: number) {
+async function fetchApprovedBeliefs(limit: number) {
   const result = await pool.query<SynthesizedBeliefRow>(
     `
-      SELECT *
-      FROM synthesized_beliefs
-      WHERE status = 'new'
-      ORDER BY created_at ASC, id ASC
+      SELECT
+        beliefs.*,
+        cases.id AS approval_case_id
+      FROM synthesized_beliefs beliefs
+      INNER JOIN listing_approval_cases cases
+        ON cases.belief_id = beliefs.id
+      WHERE beliefs.status = 'new'
+        AND cases.status = 'approved'
+        AND cases.linked_proposal_id IS NULL
+        AND beliefs.linked_proposal_id IS NULL
+      ORDER BY beliefs.created_at ASC, beliefs.id ASC
       LIMIT $1
     `,
     [limit],
   );
 
-  return result.rows.map(mapSynthesizedBeliefRow);
+  return result.rows.map(mapApprovedSynthesizedBeliefRow);
 }
 
 async function updateBeliefStatus(
@@ -220,6 +240,42 @@ async function submitProposal(belief: SynthesizedBelief) {
   return payload.id ?? null;
 }
 
+async function markBeliefAndCaseProposed(belief: ApprovedSynthesizedBelief, proposalId: string) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      `
+        UPDATE synthesized_beliefs
+        SET
+          status = 'proposed',
+          linked_proposal_id = $2,
+          updated_at = NOW()
+        WHERE id = $1
+      `,
+      [belief.id, proposalId],
+    );
+    await client.query(
+      `
+        UPDATE listing_approval_cases
+        SET
+          status = 'proposed',
+          linked_proposal_id = $2,
+          last_reason = $3,
+          updated_at = NOW()
+        WHERE id = $1
+      `,
+      [belief.approval_case_id, proposalId, `proposal_published:${proposalId}`],
+    );
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 async function tick() {
   if (tickInFlight) {
     return;
@@ -227,11 +283,15 @@ async function tick() {
 
   tickInFlight = true;
   try {
-    const beliefs = await fetchNewBeliefs(batchSize);
+    const beliefs = await fetchApprovedBeliefs(batchSize);
     for (const belief of beliefs) {
       try {
         const proposalId = await submitProposal(belief);
-        await updateBeliefStatus(belief.id, "proposed", { proposalId });
+        if (proposalId) {
+          await markBeliefAndCaseProposed(belief, proposalId);
+        } else {
+          await updateBeliefStatus(belief.id, "suppressed", { reason: "proposal_missing_id" });
+        }
       } catch (error) {
         if (
           String(error).includes("belief_not_machine_resolvable") ||
@@ -284,7 +344,17 @@ app.post("/v1/internal/proposal-agent/run-once", async () => {
 });
 
 async function start() {
-  await ensureCoreSchema(pool);
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    try {
+      await ensureCoreSchema(pool);
+      break;
+    } catch (error) {
+      if (attempt === 19) {
+        throw error;
+      }
+      await delay(250);
+    }
+  }
   await app.listen({ port, host: "0.0.0.0" });
   void tick();
   setInterval(() => {

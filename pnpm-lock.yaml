@@ -122,6 +122,21 @@ importers:
         specifier: ^5.3.2
         version: 5.8.2
 
+  services/approval-agent:
+    dependencies:
+      '@automakit/persistence':
+        specifier: workspace:*
+        version: link:../../packages/persistence
+      '@automakit/sdk-types':
+        specifier: workspace:*
+        version: link:../../packages/sdk-types
+      '@automakit/world-sim':
+        specifier: workspace:*
+        version: link:../../packages/world-sim
+      fastify:
+        specifier: ^5.3.2
+        version: 5.8.2
+
   services/auth-registry:
     dependencies:
       '@automakit/persistence':

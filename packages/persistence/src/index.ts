@@ -7,9 +7,85 @@ export function getDatabaseUrl() {
 }
 
 export function createDatabasePool() {
-  return new Pool({
+  const pool = new Pool({
     connectionString: getDatabaseUrl(),
+    max: Math.max(1, Number(process.env.DATABASE_POOL_MAX ?? "1")),
   });
+
+  const originalQuery = pool.query.bind(pool);
+  function inlineSqlValue(value: unknown): string {
+    if (value === null || value === undefined) {
+      return "NULL";
+    }
+    if (typeof value === "number") {
+      return Number.isFinite(value) ? String(value) : "NULL";
+    }
+    if (typeof value === "boolean") {
+      return value ? "TRUE" : "FALSE";
+    }
+    if (value instanceof Date) {
+      return `'${value.toISOString().replace(/'/g, "''")}'`;
+    }
+    if (typeof value === "bigint") {
+      return value.toString();
+    }
+    if (Array.isArray(value)) {
+      if (value.length === 0) {
+        return "ARRAY[]::text[]";
+      }
+      if (value.every((entry) => entry === null || entry === undefined || typeof entry === "string" || typeof entry === "number" || typeof entry === "boolean" || entry instanceof Date || typeof entry === "bigint")) {
+        return `ARRAY[${value.map((entry) => inlineSqlValue(entry)).join(", ")}]`;
+      }
+      return `'${JSON.stringify(value).replace(/'/g, "''")}'`;
+    }
+
+    const serialized =
+      typeof value === "string" ? value : JSON.stringify(value);
+    return `'${String(serialized).replace(/'/g, "''")}'`;
+  }
+
+  function inlineQuery(text: string, values: unknown[] | undefined): string {
+    if (!values || values.length === 0) {
+      return text;
+    }
+
+    return text.replace(/\$(\d+)/g, (match, index) => {
+      const value = values[Number(index) - 1];
+      return value === undefined ? match : inlineSqlValue(value);
+    });
+  }
+
+  pool.query = ((...args: unknown[]) => {
+    if (typeof args[0] === "string") {
+      const [text, values, callback] = args as [
+        string,
+        unknown[] | undefined,
+        ((err: Error | null, result: unknown) => void) | undefined,
+      ];
+      const sql = inlineQuery(text, values);
+      if (typeof callback === "function") {
+        return originalQuery(sql, callback);
+      }
+      return originalQuery(sql);
+    }
+
+    const [config, callback] = args as [
+      Record<string, unknown>,
+      ((err: Error | null, result: unknown) => void) | undefined,
+    ];
+    if (config && typeof config === "object") {
+      const inlineConfig = config as any;
+      const sql = inlineQuery(String(inlineConfig.text ?? ""), Array.isArray(inlineConfig.values) ? inlineConfig.values : undefined);
+      if (typeof callback === "function") {
+        return originalQuery(sql, callback as any);
+      }
+      return originalQuery(sql);
+    }
+
+    return originalQuery(config as any, callback as any);
+  }) as typeof pool.query;
+
+  return pool;
 }
 
 export async function ensureCoreSchema(pool: Pool) {
@@ -250,6 +326,44 @@ export async function ensureCoreSchema(pool: Pool) {
 
     CREATE INDEX IF NOT EXISTS idx_synthesized_beliefs_status_created
       ON synthesized_beliefs (status, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS listing_approval_cases (
+      id TEXT PRIMARY KEY,
+      belief_id TEXT NOT NULL UNIQUE REFERENCES synthesized_beliefs(id) ON DELETE CASCADE,
+      run_id TEXT NOT NULL REFERENCES simulation_runs(id) ON DELETE CASCADE,
+      status TEXT NOT NULL,
+      quorum_required INTEGER NOT NULL,
+      min_approvals INTEGER NOT NULL,
+      approve_count INTEGER NOT NULL DEFAULT 0,
+      reject_count INTEGER NOT NULL DEFAULT 0,
+      quarantine_count INTEGER NOT NULL DEFAULT 0,
+      risk_veto BOOLEAN NOT NULL DEFAULT FALSE,
+      linked_proposal_id TEXT,
+      last_reason TEXT,
+      created_at TIMESTAMPTZ NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_listing_approval_cases_pending
+      ON listing_approval_cases (status, updated_at DESC, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS listing_approval_votes (
+      id TEXT PRIMARY KEY,
+      case_id TEXT NOT NULL REFERENCES listing_approval_cases(id) ON DELETE CASCADE,
+      belief_id TEXT NOT NULL REFERENCES synthesized_beliefs(id) ON DELETE CASCADE,
+      run_id TEXT NOT NULL REFERENCES simulation_runs(id) ON DELETE CASCADE,
+      agent_id TEXT NOT NULL,
+      decision TEXT NOT NULL,
+      resolvability_score DOUBLE PRECISION NOT NULL,
+      ambiguity_score DOUBLE PRECISION NOT NULL,
+      manipulation_risk_score DOUBLE PRECISION NOT NULL,
+      reasons JSONB NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL,
+      UNIQUE (case_id, agent_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_listing_approval_votes_case_created
+      ON listing_approval_votes (case_id, created_at DESC);
 
     CREATE TABLE IF NOT EXISTS markets (
       id TEXT PRIMARY KEY,

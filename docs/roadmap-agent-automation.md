@@ -56,7 +56,7 @@ Outcome:
 
 Status:
 
-- In progress. Current repo now has versioned simulation-runtime contracts, a runtime client interface in `simulation-orchestrator`, and a Python simulation-runtime service; approval-agent quorum is still pending.
+- In progress. Current repo now has versioned simulation-runtime contracts, a runtime client interface in `simulation-orchestrator`, a Python simulation-runtime service, and an implemented approval-agent quorum gate.
 
 Core capabilities:
 

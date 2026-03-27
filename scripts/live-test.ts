@@ -175,6 +175,9 @@ async function main() {
   const feedPort = await reservePort();
   const collectorAlphaPort = await reservePort();
   const collectorBetaPort = await reservePort();
+  const approvalAlphaPort = await reservePort();
+  const approvalBetaPort = await reservePort();
+  const approvalGammaPort = await reservePort();
   const worldInputPort = await reservePort();
   const orchestratorPort = await reservePort();
   const worldModelAlphaPort = await reservePort();
@@ -187,6 +190,8 @@ async function main() {
   const databaseDirectory = await mkdtemp(path.join(os.tmpdir(), "automakit-live-test-"));
   const databaseUrl = `postgres://postgres:postgres@127.0.0.1:${databasePort}/postgres`;
   const repoRoot = process.cwd();
+  const dbPool = new Pool({ connectionString: databaseUrl, max: 1 });
+  dbPool.on("error", () => undefined);
   const nextBin = path.join(repoRoot, "node_modules", ".pnpm", "node_modules", ".bin", "next");
   const pgliteServerBin = path.join(repoRoot, "node_modules", ".bin", "pglite-server");
   const resolvedCloseTime = new Date(Date.now() - 60_000).toISOString();
@@ -632,7 +637,7 @@ async function main() {
           "--port",
           String(databasePort),
           "--max-connections",
-          "16",
+          "32",
         ],
       ),
     );
@@ -835,20 +840,94 @@ async function main() {
     );
     processes.push(
       startProcess(
-        "resolution-collector-alpha",
+        "approval-agent-alpha",
         process.execPath,
         ["dist/index.js"],
         {
           DATABASE_URL: databaseUrl,
-          MARKET_SERVICE_URL: "http://127.0.0.1:4003",
-          RESOLUTION_SERVICE_URL: "http://127.0.0.1:4006",
-          COLLECTOR_AGENT_ID: "resolver-alpha",
-          RESOLUTION_COLLECTOR_PORT: String(collectorAlphaPort),
-          RESOLUTION_COLLECTOR_INTERVAL_MS: "500",
+          APPROVAL_AGENT_PORT: String(approvalAlphaPort),
+          APPROVAL_AGENT_ID: "approval-alpha",
+          APPROVAL_AGENT_INTERVAL_MS: "250",
+          APPROVAL_AGENT_BATCH_SIZE: "20",
+          APPROVAL_QUORUM_REQUIRED: "2",
+          APPROVAL_MIN_APPROVALS: "2",
+          APPROVAL_MAX_AMBIGUITY: "0.4",
+          APPROVAL_MIN_RESOLVABILITY: "0.55",
+          APPROVAL_MAX_MANIPULATION_RISK: "0.7",
         },
-        path.join(repoRoot, "services", "resolution-collector"),
+        path.join(repoRoot, "services", "approval-agent"),
       ),
     );
+    processes.push(
+      startProcess(
+        "approval-agent-beta",
+        process.execPath,
+        ["dist/index.js"],
+        {
+          DATABASE_URL: databaseUrl,
+          APPROVAL_AGENT_PORT: String(approvalBetaPort),
+          APPROVAL_AGENT_ID: "approval-beta",
+          APPROVAL_AGENT_INTERVAL_MS: "250",
+          APPROVAL_AGENT_BATCH_SIZE: "20",
+          APPROVAL_QUORUM_REQUIRED: "2",
+          APPROVAL_MIN_APPROVALS: "2",
+          APPROVAL_MAX_AMBIGUITY: "0.4",
+          APPROVAL_MIN_RESOLVABILITY: "0.55",
+          APPROVAL_MAX_MANIPULATION_RISK: "0.7",
+        },
+        path.join(repoRoot, "services", "approval-agent"),
+      ),
+    );
+    processes.push(
+      startProcess(
+        "approval-agent-gamma",
+        process.execPath,
+        ["dist/index.js"],
+        {
+          DATABASE_URL: databaseUrl,
+          APPROVAL_AGENT_PORT: String(approvalGammaPort),
+          APPROVAL_AGENT_ID: "approval-gamma",
+          APPROVAL_AGENT_INTERVAL_MS: "250",
+          APPROVAL_AGENT_BATCH_SIZE: "20",
+          APPROVAL_QUORUM_REQUIRED: "2",
+          APPROVAL_MIN_APPROVALS: "2",
+          APPROVAL_MAX_AMBIGUITY: "0.4",
+          APPROVAL_MIN_RESOLVABILITY: "0.55",
+          APPROVAL_MAX_MANIPULATION_RISK: "0.7",
+        },
+        path.join(repoRoot, "services", "approval-agent"),
+      ),
+    );
+    processes.push(
+      startProcess(
+        "proposal-agent",
+        process.execPath,
+        ["dist/index.js"],
+        {
+          DATABASE_URL: databaseUrl,
+          PROPOSAL_PIPELINE_URL: "http://127.0.0.1:4005",
+          PROPOSAL_AGENT_PORT: String(proposalAgentPort),
+          PROPOSAL_AGENT_INTERVAL_MS: "250",
+        },
+        path.join(repoRoot, "services", "proposal-agent"),
+      ),
+    );
+    processes.push(
+        startProcess(
+          "resolution-collector-alpha",
+          process.execPath,
+          ["dist/index.js"],
+          {
+            DATABASE_URL: databaseUrl,
+            MARKET_SERVICE_URL: "http://127.0.0.1:4003",
+            RESOLUTION_SERVICE_URL: "http://127.0.0.1:4006",
+            COLLECTOR_AGENT_ID: "resolver-alpha",
+            RESOLUTION_COLLECTOR_PORT: String(collectorAlphaPort),
+            RESOLUTION_COLLECTOR_INTERVAL_MS: "500",
+          },
+          path.join(repoRoot, "services", "resolution-collector"),
+        ),
+      );
     processes.push(
       startProcess(
         "resolution-collector-beta",
@@ -900,6 +979,9 @@ async function main() {
     await waitForJson(`http://127.0.0.1:${scenarioBullPort}/health`);
     await waitForJson(`http://127.0.0.1:${scenarioBearPort}/health`);
     await waitForJson(`http://127.0.0.1:${synthesisPort}/health`);
+    await waitForJson(`http://127.0.0.1:${approvalAlphaPort}/health`);
+    await waitForJson(`http://127.0.0.1:${approvalBetaPort}/health`);
+    await waitForJson(`http://127.0.0.1:${approvalGammaPort}/health`);
     await waitForJson(`http://127.0.0.1:${proposalAgentPort}/health`);
     await waitForJson(`http://127.0.0.1:${collectorAlphaPort}/health`);
     await waitForJson(`http://127.0.0.1:${collectorBetaPort}/health`);
@@ -1017,6 +1099,97 @@ async function main() {
       return beliefs.items.length >= 2;
     });
 
+    const liveRun = (
+      await dbPool.query<{ id: string }>(
+        `
+          SELECT id
+          FROM simulation_runs
+          ORDER BY started_at DESC, id DESC
+          LIMIT 1
+        `,
+      )
+    ).rows[0];
+    if (!liveRun?.id) {
+      throw new Error("Expected at least one simulation run for approval tranche");
+    }
+
+    const invalidApprovalBeliefId = "approval-invalid-belief-live-test";
+    const invalidApprovalBeliefTitle = "Approval parity invalid belief";
+    await dbPool.query(
+      `
+        INSERT INTO synthesized_beliefs (
+          id,
+          run_id,
+          agent_id,
+          belief_dedupe_key,
+          parent_hypothesis_ids,
+          agreement_score,
+          disagreement_score,
+          confidence_score,
+          conflict_notes,
+          hypothesis,
+          status,
+          suppression_reason,
+          linked_proposal_id,
+          created_at,
+          updated_at
+        )
+        VALUES (
+          $1,
+          $2,
+          'approval-test-seed',
+          $3,
+          $4::jsonb,
+          0.91,
+          0.07,
+          0.88,
+          NULL,
+          $5::jsonb,
+          'new',
+          NULL,
+          NULL,
+          NOW(),
+          NOW()
+        )
+        ON CONFLICT (run_id, agent_id, belief_dedupe_key) DO NOTHING
+      `,
+      [
+        invalidApprovalBeliefId,
+        liveRun.id,
+        "approval-invalid-dedupe-key",
+        JSON.stringify(["approval-invalid-parent"]),
+        JSON.stringify({
+          id: invalidApprovalBeliefId,
+          run_id: liveRun.id,
+          agent_id: "approval-test-seed",
+          parent_ids: ["approval-invalid-parent"],
+          hypothesis_kind: "price_threshold",
+          category: "macro",
+          subject: invalidApprovalBeliefTitle,
+          predicate: "price_threshold",
+          target_time: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+          confidence_score: 0.88,
+          reasoning_summary: "Intentional invalid belief for approval quarantine testing.",
+          source_signal_ids: ["approval-invalid-signal"],
+          machine_resolvable: true,
+          dedupe_key: "approval-invalid-dedupe-key",
+          created_at: new Date().toISOString(),
+        }),
+      ],
+    );
+
+    await waitForCondition("approval quorum cases", async () => {
+      const cases = (await waitForJson(
+        `http://127.0.0.1:${approvalAlphaPort}/v1/internal/listing-approval-cases?limit=20`,
+      )) as {
+        items: Array<{ belief_id: string; status: string; linked_proposal_id?: string | null }>;
+      };
+      return (
+        cases.items.some((entry) => entry.status === "approved" || entry.status === "proposed") &&
+        cases.items.some((entry) => entry.belief_id === invalidApprovalBeliefId && entry.status === "quarantined")
+      );
+    });
+
     await waitForCondition("published proposals", async () => {
       const proposals = (await waitForJson("http://127.0.0.1:4005/v1/proposals")) as {
         items: Array<{ status: string }>;
@@ -1027,6 +1200,23 @@ async function main() {
     const proposals = (await waitForJson("http://127.0.0.1:4005/v1/proposals")) as {
       items: Array<{ title: string; status: string; linked_market_id?: string }>;
     };
+    if (proposals.items.some((proposal) => proposal.title === invalidApprovalBeliefTitle)) {
+      throw new Error(`Invalid belief was published unexpectedly: ${JSON.stringify(proposals.items)}`);
+    }
+
+    const approvalCases = (await waitForJson(
+      `http://127.0.0.1:${approvalAlphaPort}/v1/internal/listing-approval-cases?limit=50`,
+    )) as {
+      items: Array<{ belief_id: string; status: string; linked_proposal_id?: string | null }>;
+    };
+    const approvedCases = approvalCases.items.filter((entry) => entry.status === "approved" || entry.status === "proposed");
+    if (approvedCases.length === 0) {
+      throw new Error(`Expected at least one approved/proposed approval case: ${JSON.stringify(approvalCases.items)}`);
+    }
+    const invalidApprovalCase = approvalCases.items.find((entry) => entry.belief_id === invalidApprovalBeliefId);
+    if (!invalidApprovalCase || invalidApprovalCase.status !== "quarantined") {
+      throw new Error(`Invalid belief was not quarantined: ${JSON.stringify(approvalCases.items)}`);
+    }
 
     await waitForCondition("published markets", async () => {
       const markets = (await waitForJson("http://127.0.0.1:4003/v1/markets")) as {
@@ -1204,6 +1394,7 @@ async function main() {
         resolve();
       });
     });
+    await dbPool.end().catch(() => undefined);
     await rm(databaseDirectory, { recursive: true, force: true });
   }
 }

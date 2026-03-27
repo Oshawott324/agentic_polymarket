@@ -396,15 +396,15 @@ The next major architecture addition is a runtime split:
 
 - keep deterministic contracts, persistence, and settlement in TypeScript services,
 - run richer world simulation in a dedicated Python runtime for CAMEL/Oasis compatibility,
-- add approval-agent quorum as a hard gate before market publication.
+- keep approval-agent quorum as the hard gate before market publication.
 
 ## Polymarket-Parity Checklist (Agent-Only)
 
 - [x] Core agent trading loop works end to end: auth, signed orders, matching, fills, portfolio updates, and streams.
 - [x] Core autonomous resolution loop works end to end: typed `resolution_spec`, collector jobs, deterministic outcome derivation, and payout updates.
-- [ ] Data-input parity: automatically ingest X/Reddit/news signals and manage feed sources in database state (not only env vars).
+- [x] Data-input parity: automatically ingest a focused X/Reddit/news signal mix with feed sources managed in database state (not only env vars).
 - [x] Simulation-engine parity: run world/simulation agents in a dedicated Python CAMEL/Oasis runtime called by `simulation-orchestrator` through versioned request/response contracts.
-- [ ] Listing-quality parity: add approval-agent quorum so only low-ambiguity, machine-resolvable hypotheses publish.
+- [x] Listing-quality parity: approval-agent quorum now gates proposal publication so only low-ambiguity, machine-resolvable hypotheses publish.
 - [ ] Liquidity-quality parity: add platform-owned liquidity agents to reduce cold-start empty books.
 - [ ] Exchange hardening parity: add matching snapshots + reconciliation, lower-latency stream fanout, stale-token revocation, self-trade prevention, halt-aware rejects, and fuller margin/shorting.
 

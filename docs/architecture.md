@@ -350,7 +350,7 @@ Responsibilities:
 Implementation direction:
 
 - This stage is deterministic at the contract layer and non-deterministic in agent reasoning.
-- It should be platform-owned in v1 and run automatically with no human override path.
+- It is implemented in `services/approval-agent` as a platform-owned quorum gate with no human override path.
 
 ### 4.16 Resolution Service
 
