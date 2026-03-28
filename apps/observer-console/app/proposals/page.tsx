@@ -1,14 +1,17 @@
-import { Card, PageShell } from "@automakit/ui";
+import Link from "next/link";
 
 export const dynamic = "force-dynamic";
 
 type Proposal = {
   id: string;
+  category?: string;
   title: string;
   status: "queued" | "published" | "suppressed";
   confidence_score: number;
   autonomy_note: string;
   origin: "agent" | "automation";
+  close_time?: string;
+  created_at?: string;
 };
 
 async function fetchProposals(): Promise<Proposal[]> {
@@ -32,28 +35,70 @@ async function fetchProposals(): Promise<Proposal[]> {
 
 export default async function ProposalQueuePage() {
   const proposals = await fetchProposals();
+  const published = proposals.filter((proposal) => proposal.status === "published").length;
+  const queued = proposals.filter((proposal) => proposal.status === "queued").length;
+  const suppressed = proposals.filter((proposal) => proposal.status === "suppressed").length;
 
   return (
-    <PageShell
-      title="Proposal Queue"
-      subtitle="Watch-only queue of autonomous proposal outcomes."
-    >
-      <div style={{ display: "grid", gap: 16 }}>
+    <main className="obs-root">
+      <div className="obs-noise" />
+      <div className="obs-shell">
+        <header className="obs-topbar">
+          <Link href="/" className="obs-brand">
+            Automakit Observer
+          </Link>
+          <nav className="obs-nav">
+            <a href="http://localhost:3000">Markets</a>
+            <Link href="/proposals" className="active">
+              Proposals
+            </Link>
+          </nav>
+          <span className="obs-pill">Agents Pipeline</span>
+        </header>
+
+        <section className="obs-hero">
+          <h1>Proposal Queue</h1>
+          <p>Listing approval and publication outcomes from the autonomous pipeline.</p>
+          <div className="obs-stats">
+            <div>
+              <span>Published</span>
+              <strong>{published}</strong>
+            </div>
+            <div>
+              <span>Queued</span>
+              <strong>{queued}</strong>
+            </div>
+            <div>
+              <span>Suppressed</span>
+              <strong>{suppressed}</strong>
+            </div>
+          </div>
+        </section>
+
         {proposals.length === 0 ? (
-          <Card heading="No proposals">
+          <section className="obs-panel">
+            <h2>No proposals</h2>
             <p>No autonomous proposals are currently visible.</p>
-          </Card>
+          </section>
         ) : (
-          proposals.map((proposal) => (
-            <Card key={proposal.id} heading={proposal.status}>
-              <p style={{ fontSize: 20, lineHeight: 1.35 }}>{proposal.title}</p>
-              <p>Origin: {proposal.origin}</p>
-              <p>Confidence: {proposal.confidence_score.toFixed(2)}</p>
-              <p>{proposal.autonomy_note}</p>
-            </Card>
-          ))
+          <section className="obs-grid">
+            {proposals.map((proposal) => (
+              <article key={proposal.id} className="obs-proposal-card">
+                <div className="obs-card-head">
+                  <span className="obs-category">{proposal.category ?? "uncategorized"}</span>
+                  <span className={`obs-status ${proposal.status}`}>{proposal.status}</span>
+                </div>
+                <h2>{proposal.title}</h2>
+                <div className="obs-meta">
+                  <span>Origin {proposal.origin}</span>
+                  <span>Confidence {(proposal.confidence_score * 100).toFixed(1)}%</span>
+                </div>
+                <p>{proposal.autonomy_note}</p>
+              </article>
+            ))}
+          </section>
         )}
       </div>
-    </PageShell>
+    </main>
   );
 }

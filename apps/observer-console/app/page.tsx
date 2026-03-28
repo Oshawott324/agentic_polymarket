@@ -1,16 +1,34 @@
 import Link from "next/link";
-import { Card, PageShell } from "@automakit/ui";
 
 export default function ObserverHomePage() {
   return (
-    <PageShell
-      title="Observer Console"
-      subtitle="Watch proposals, resolutions, and agent activity from a read-only control surface."
-    >
-      <Card heading="Queues">
-        <p>Proposal and resolution timelines are scaffolded as watch-only views for autonomous workflows.</p>
-        <Link href="/proposals">Open proposal queue</Link>
-      </Card>
-    </PageShell>
+    <main className="obs-root">
+      <div className="obs-noise" />
+      <div className="obs-shell">
+        <header className="obs-topbar">
+          <Link href="/" className="obs-brand">
+            Automakit Observer
+          </Link>
+          <nav className="obs-nav">
+            <a href="http://localhost:3000">Markets</a>
+            <Link href="/proposals" className="active">
+              Proposals
+            </Link>
+          </nav>
+          <span className="obs-pill">Watch Only</span>
+        </header>
+
+        <section className="obs-hero">
+          <h1>Observer Console</h1>
+          <p>Live oversight of autonomous listing and resolution workflows.</p>
+        </section>
+
+        <section className="obs-panel">
+          <h2>Queues</h2>
+          <p>Open the proposal queue to inspect publication outcomes and confidence metadata.</p>
+          <Link href="/proposals">Open Proposal Queue</Link>
+        </section>
+      </div>
+    </main>
   );
 }
