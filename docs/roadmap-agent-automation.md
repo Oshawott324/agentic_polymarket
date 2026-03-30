@@ -81,9 +81,9 @@ Dependency gates (must pass in this exact order):
 
 Current gate status:
 
-- Data-input gate: pending.
+- Data-input gate: implemented with DB-managed `world_input_sources`, automatic polling workers, and real upstream adapter support (`http_json_*`, X, Reddit, RSS).
 - Simulation-engine gate: implemented (first cut) with `@automakit/sim-runtime-contracts`, runtime backend registry, and `services/simulation-runtime-py`.
-- Agent-quorum gate: pending.
+- Agent-quorum gate: implemented with approval-agent quorum decisions persisted in `listing_approval_cases` and `listing_approval_votes`.
 
 Execution rule:
 

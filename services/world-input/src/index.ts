@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import Fastify from "fastify";
 import { createDatabasePool, ensureCoreSchema, parseJsonField, toIsoTimestamp } from "@automakit/persistence";
+import { ProxyAgent, setGlobalDispatcher } from "undici";
 import {
   buildDedupeKey,
   inferEntityRefs,
@@ -103,6 +104,23 @@ const maxSourcesPerTick = Math.max(claimBatchSize, Number(process.env.WORLD_INPU
 const app = Fastify({ logger: true });
 const pool = createDatabasePool();
 
+const outboundProxyUrl =
+  process.env.HTTPS_PROXY ??
+  process.env.https_proxy ??
+  process.env.HTTP_PROXY ??
+  process.env.http_proxy ??
+  process.env.ALL_PROXY ??
+  process.env.all_proxy;
+
+if (outboundProxyUrl) {
+  try {
+    setGlobalDispatcher(new ProxyAgent(outboundProxyUrl));
+    app.log.info({ outbound_proxy_url: outboundProxyUrl }, "world_input_proxy_enabled");
+  } catch (error) {
+    app.log.error({ err: error }, "world_input_proxy_configuration_failed");
+  }
+}
+
 let tickInFlight = false;
 let lastTickAt: string | null = null;
 let lastTickError: string | null = null;
@@ -139,6 +157,43 @@ function asNumber(value: unknown): number | null {
     return Number.isFinite(parsed) ? parsed : null;
   }
   return null;
+}
+
+function readPath(root: unknown, path: string) {
+  const segments = path
+    .split(".")
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+  let current: unknown = root;
+  for (const segment of segments) {
+    if (!current || typeof current !== "object") {
+      return undefined;
+    }
+    current = (current as Record<string, unknown>)[segment];
+  }
+  return current;
+}
+
+function clampNumber(value: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function formatUtcDay(value: string) {
+  return value.slice(0, 10);
+}
+
+function operatorPhrase(operator: "gt" | "gte" | "lt" | "lte") {
+  switch (operator) {
+    case "gte":
+      return "at or above";
+    case "gt":
+      return "above";
+    case "lte":
+      return "at or below";
+    case "lt":
+    default:
+      return "below";
+  }
 }
 
 function normalizeTimestamp(value: unknown): string | null {
@@ -758,6 +813,91 @@ async function fetchSourceItems(source: SourceWithConfig): Promise<SourcePollRes
   }
 }
 
+function expandHttpJsonPriceItems(source: SourceWithConfig, items: Record<string, unknown>[]) {
+  if (items.length === 0) {
+    return items;
+  }
+
+  const config = source.config_json;
+  const generationMode =
+    asString(config.market_generation_mode) ??
+    asString(config.market_mode) ??
+    "price_threshold_auto";
+
+  if (generationMode !== "price_threshold_auto") {
+    return items;
+  }
+
+  const pricePath = asString(config.price_path) ?? "price";
+  const rawPrice = readPath(items[0], pricePath);
+  const currentPrice = asNumber(rawPrice);
+  if (currentPrice === null || currentPrice <= 0) {
+    throw new Error(`world_input_source_price_path_invalid:${source.key}:${pricePath}`);
+  }
+
+  const assetSymbol = (asString(config.asset_symbol) ?? asString(config.symbol) ?? "ASSET").toUpperCase();
+  const quoteSymbol = (asString(config.quote_symbol) ?? "USD").toUpperCase();
+  const category = asString(config.category) ?? "crypto";
+  const operatorRaw = asString(config.operator);
+  const operator: "gt" | "gte" | "lt" | "lte" =
+    operatorRaw === "gt" || operatorRaw === "lte" || operatorRaw === "lt"
+      ? operatorRaw
+      : "gte";
+  const thresholdPercent = clampNumber(asNumber(config.threshold_percent) ?? 3, 0.25, 25);
+  const thresholdRoundTo = Math.max(0.01, asNumber(config.threshold_round_to) ?? 100);
+  const horizonHours = clampNumber(asNumber(config.market_horizon_hours) ?? 24, 1, 24 * 14);
+  const windowMinutes = clampNumber(asNumber(config.market_window_minutes) ?? 60, 5, 24 * 60);
+  const canonicalSourceUrl = asString(config.canonical_source_url) ?? source.source_url;
+  if (!canonicalSourceUrl) {
+    throw new Error(`world_input_source_canonical_url_missing:${source.key}`);
+  }
+
+  const direction = operator === "lt" || operator === "lte" ? -1 : 1;
+  const thresholdBase = currentPrice * (1 + direction * thresholdPercent / 100);
+  const threshold = Math.max(
+    thresholdRoundTo,
+    Math.round(thresholdBase / thresholdRoundTo) * thresholdRoundTo,
+  );
+
+  const now = Date.now();
+  const targetMs = now + horizonHours * 60 * 60 * 1000;
+  const windowMs = windowMinutes * 60 * 1000;
+  const targetBucketMs = Math.floor(targetMs / windowMs) * windowMs;
+  const targetTime = new Date(targetBucketMs).toISOString();
+  const dateLabel = formatUtcDay(targetTime);
+  const thresholdLabel = Math.round(threshold).toLocaleString("en-US");
+  const sourceId = `${assetSymbol.toLowerCase()}-${operator}-${Math.round(threshold)}-${targetBucketMs}`;
+  const title = `Will ${assetSymbol} be ${operatorPhrase(operator)} $${thresholdLabel} by ${dateLabel} UTC?`;
+
+  return [
+    {
+      source_id: sourceId,
+      source_url: source.source_url ?? canonicalSourceUrl,
+      title,
+      summary: `${assetSymbol} ${quoteSymbol} signal from ${source.key}. Current ${Math.round(currentPrice).toLocaleString("en-US")}; threshold ${operatorPhrase(operator)} ${thresholdLabel} by ${dateLabel} UTC.`,
+      effective_at: targetTime,
+      payload: {
+        kind: "price_threshold",
+        category,
+        asset_symbol: assetSymbol,
+        quote_symbol: quoteSymbol,
+        operator,
+        threshold,
+        target_time: targetTime,
+        canonical_source_url: canonicalSourceUrl,
+        observation_price_path: pricePath,
+      },
+    },
+  ];
+}
+
+function expandSourceItems(source: SourceWithConfig, items: Record<string, unknown>[]) {
+  if (source.adapter === "http_json_price") {
+    return expandHttpJsonPriceItems(source, items);
+  }
+  return items;
+}
+
 async function startRunRecord(sourceId: string) {
   const runId = randomUUID();
   await pool.query(
@@ -886,9 +1026,10 @@ async function pollSource(source: SourceWithConfig) {
   let metadata: Record<string, unknown> = {};
   try {
     const result = await fetchSourceItems(source);
-    fetchedCount = result.items.length;
+    const expandedItems = expandSourceItems(source, result.items);
+    fetchedCount = expandedItems.length;
     metadata = result.metadata;
-    for (const rawItem of result.items) {
+    for (const rawItem of expandedItems) {
       const signal = normalizeSignalFromItem(source, rawItem);
       const inserted = await upsertSignal(signal);
       if (inserted) {
@@ -1234,10 +1375,11 @@ app.post("/v1/internal/world-input/sources/:id/test", async (request, reply) => 
   const maxSample = Math.max(1, Math.min(10, Number((request.query as { sample?: string }).sample ?? "3")));
   try {
     const result = await fetchSourceItems(source);
-    const sampleSignals = result.items.slice(0, maxSample).map((item) => normalizeSignalFromItem(source, item));
+    const expandedItems = expandSourceItems(source, result.items);
+    const sampleSignals = expandedItems.slice(0, maxSample).map((item) => normalizeSignalFromItem(source, item));
     const response: SourceTestResponse = {
       source,
-      fetched_count: result.items.length,
+      fetched_count: expandedItems.length,
       next_cursor: result.next_cursor,
       sample_signals: sampleSignals,
     };

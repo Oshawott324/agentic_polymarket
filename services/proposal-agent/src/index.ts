@@ -177,10 +177,20 @@ async function fetchApprovedBeliefs(limit: number) {
       FROM synthesized_beliefs beliefs
       INNER JOIN listing_approval_cases cases
         ON cases.belief_id = beliefs.id
-      WHERE beliefs.status = 'new'
-        AND cases.status = 'approved'
-        AND cases.linked_proposal_id IS NULL
-        AND beliefs.linked_proposal_id IS NULL
+      WHERE (
+        (
+          beliefs.status = 'new'
+          AND cases.status = 'approved'
+          AND cases.linked_proposal_id IS NULL
+          AND beliefs.linked_proposal_id IS NULL
+        )
+        OR (
+          beliefs.status = 'proposed'
+          AND cases.status = 'proposed'
+          AND beliefs.linked_proposal_id IS NOT NULL
+          AND cases.linked_proposal_id = beliefs.linked_proposal_id
+        )
+      )
       ORDER BY beliefs.created_at ASC, beliefs.id ASC
       LIMIT $1
     `,
@@ -240,6 +250,16 @@ async function submitProposal(belief: SynthesizedBelief) {
   return payload.id ?? null;
 }
 
+async function fetchProposalStatus(proposalId: string) {
+  const response = await fetch(`${proposalPipelineUrl}/v1/market-proposals/${proposalId}`);
+  if (!response.ok) {
+    throw new Error(`proposal_lookup_failed:${response.status}`);
+  }
+
+  const payload = (await response.json()) as { status?: "queued" | "published" | "suppressed" };
+  return payload.status ?? null;
+}
+
 async function markBeliefAndCaseProposed(belief: ApprovedSynthesizedBelief, proposalId: string) {
   const client = await pool.connect();
   try {
@@ -286,9 +306,20 @@ async function tick() {
     const beliefs = await fetchApprovedBeliefs(batchSize);
     for (const belief of beliefs) {
       try {
+        if (belief.linked_proposal_id) {
+          const currentStatus = await fetchProposalStatus(belief.linked_proposal_id);
+          if (currentStatus === "published") {
+            continue;
+          }
+        }
+
         const proposalId = await submitProposal(belief);
         if (proposalId) {
-          await markBeliefAndCaseProposed(belief, proposalId);
+          if (belief.linked_proposal_id) {
+            await updateBeliefStatus(belief.id, "proposed", { proposalId });
+          } else {
+            await markBeliefAndCaseProposed(belief, proposalId);
+          }
         } else {
           await updateBeliefStatus(belief.id, "suppressed", { reason: "proposal_missing_id" });
         }

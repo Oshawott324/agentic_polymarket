@@ -5,9 +5,9 @@
   "scripts": {
     "build": "pnpm -r --if-present build && pnpm build:matching-engine",
     "build:matching-engine": "cargo check --manifest-path services/matching-engine/Cargo.toml",
-    "dev": "pnpm -r --parallel --if-present dev",
+    "dev": "./scripts/dev.sh",
     "dev:autonomous:native": "./scripts/dev-autonomous-native.sh",
-    "dev:infra": "docker compose -f infra/docker/docker-compose.yml up",
+    "dev:infra": "./scripts/dev-infra.sh",
     "dev:matching-engine": "cargo run --manifest-path services/matching-engine/Cargo.toml",
     "live:test": "tsx scripts/live-test.ts",
     "live:test:agent-auth": "tsx scripts/live-test-agent-auth.ts",

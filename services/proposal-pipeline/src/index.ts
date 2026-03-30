@@ -57,6 +57,8 @@ const port = Number(process.env.PROPOSAL_PIPELINE_PORT ?? 4005);
 const app = Fastify({ logger: true });
 const pool = createDatabasePool();
 const marketServiceUrl = process.env.MARKET_SERVICE_URL ?? "http://localhost:4003";
+const autoPublishThreshold = Math.max(0, Math.min(1, Number(process.env.PROPOSAL_AUTO_PUBLISH_THRESHOLD ?? 0.7)));
+const autoQueueThreshold = Math.max(0, Math.min(1, Number(process.env.PROPOSAL_AUTO_QUEUE_THRESHOLD ?? 0.45)));
 
 function mapProposalRow(row: ProposalRow): Proposal {
   return {
@@ -216,12 +218,12 @@ function scoreProposal(input: {
     confidenceScore += 0.2;
   }
   if (input.signal_source_type === "agent") {
-    confidenceScore += 0.1;
+    confidenceScore += 0.22;
   }
   if (input.signal_source_type === "news") {
     confidenceScore -= 0.05;
   }
-  if (/federalreserve|cmegroup|sec|treasury|localhost|127\.0\.0\.1/i.test(input.resolution_spec.source.canonical_url)) {
+  if (/federalreserve|cmegroup|sec|treasury|coingecko|coinbase|kraken|binance|localhost|127\.0\.0\.1/i.test(input.resolution_spec.source.canonical_url)) {
     confidenceScore += 0.12;
   }
   if (input.category === "crypto" || input.category === "macro") {
@@ -229,7 +231,11 @@ function scoreProposal(input: {
   }
 
   const status: Proposal["status"] =
-    confidenceScore >= 0.8 ? "published" : confidenceScore >= 0.45 ? "queued" : "suppressed";
+    confidenceScore >= autoPublishThreshold
+      ? "published"
+      : confidenceScore >= autoQueueThreshold
+        ? "queued"
+        : "suppressed";
   const autonomyNote =
     status === "published"
       ? "Published automatically because confidence exceeded the autonomous publication threshold."
@@ -283,7 +289,7 @@ async function maybePublishQueuedProposal(proposal: Proposal) {
   const adjustedConfidence = Math.min(1, proposal.confidence_score + (proposal.observation_count - 1) * 0.12);
   proposal.confidence_score = adjustedConfidence;
 
-  if (adjustedConfidence < 0.8) {
+  if (adjustedConfidence < autoPublishThreshold) {
     proposal.autonomy_note =
       "Queued for autonomous republication until repeated signals raise confidence above the publication threshold.";
     return proposal;

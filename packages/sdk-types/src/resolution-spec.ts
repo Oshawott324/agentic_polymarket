@@ -86,7 +86,15 @@ export type ResolutionSpecValidationResult =
 const resolutionRegistry: Record<ResolutionKind, ResolutionRegistryEntry> = {
   price_threshold: {
     kind: "price_threshold",
-    allowed_domains: ["cmegroup.com", "coinbase.com", "kraken.com", "localhost", "127.0.0.1"],
+    allowed_domains: [
+      "cmegroup.com",
+      "coinbase.com",
+      "kraken.com",
+      "coingecko.com",
+      "binance.com",
+      "localhost",
+      "127.0.0.1",
+    ],
     required_fields: {
       price: "number",
     },

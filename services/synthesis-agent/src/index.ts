@@ -83,9 +83,24 @@ const port = Number(process.env.SYNTHESIS_AGENT_PORT ?? 4015);
 const intervalMs = Number(process.env.SYNTHESIS_AGENT_INTERVAL_MS ?? 1000);
 const batchSize = Number(process.env.SYNTHESIS_AGENT_BATCH_SIZE ?? 10);
 const agentId = process.env.SYNTHESIS_AGENT_ID ?? "synthesis-core";
+const minConfidenceForNew = Math.max(0, Math.min(1, Number(process.env.SYNTHESIS_MIN_CONFIDENCE_FOR_NEW ?? 0.52)));
+const maxDisagreementForNew = Math.max(0, Math.min(1, Number(process.env.SYNTHESIS_MAX_DISAGREEMENT_FOR_NEW ?? 0.35)));
 const mode = process.env.SYNTHESIS_AGENT_MODE ?? "llm";
-const llmStrict = (process.env.SYNTHESIS_AGENT_LLM_STRICT ?? "true").toLowerCase() !== "false";
-const llmClient = mode === "llm" ? loadLlmClientFromEnv() : null;
+const llmStrict = (process.env.SYNTHESIS_AGENT_LLM_STRICT ?? "false").toLowerCase() !== "false";
+const llmClient = (() => {
+  if (mode !== "llm") {
+    return null;
+  }
+  try {
+    return loadLlmClientFromEnv();
+  } catch (error) {
+    if (llmStrict) {
+      throw error;
+    }
+    console.warn("[synthesis-agent] llm init failed; using heuristic mode fallback", error);
+    return null;
+  }
+})();
 const app = Fastify({ logger: true });
 const pool = createDatabasePool();
 
@@ -284,9 +299,9 @@ function synthesizeHeuristic(runId: string, aggregate: CandidateAggregate) {
       ? `Divergence observed across path labels: ${aggregate.scenarioEntries.map((entry) => entry.label).join(", ")}.`
       : null;
   const status: SynthesizedBelief["status"] =
-    aggregate.base.machine_resolvable && combinedConfidence >= 0.62 && disagreementScore <= 0.35
+    aggregate.base.machine_resolvable && combinedConfidence >= minConfidenceForNew && disagreementScore <= maxDisagreementForNew
       ? "new"
-      : disagreementScore > 0.35
+      : disagreementScore > maxDisagreementForNew
         ? "ambiguous"
         : "suppressed";
   const suppressionReason =
@@ -502,7 +517,7 @@ async function tick() {
 
       const aggregates = collectCandidates(directHypotheses, scenarioPaths);
       let beliefs: SynthesizedBelief[] = [];
-      if (mode === "llm") {
+      if (mode === "llm" && llmClient) {
         try {
           beliefs = await synthesizeWithLlm(run.id, aggregates);
         } catch (error) {

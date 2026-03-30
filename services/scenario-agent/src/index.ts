@@ -79,15 +79,28 @@ type ScenarioLlmResponse = {
   }>;
 };
 
-const port = Number(process.env.SCENARIO_AGENT_PORT ?? 4014);
+const port = Number(process.env.SCENARIO_AGENT_PORT ?? 4018);
 const intervalMs = Number(process.env.SCENARIO_AGENT_INTERVAL_MS ?? 1000);
 const batchSize = Number(process.env.SCENARIO_AGENT_BATCH_SIZE ?? 10);
 const agentId = process.env.SCENARIO_AGENT_ID ?? "scenario-base";
 const label = process.env.SCENARIO_LABEL ?? "base";
 const configuredProbability = Number(process.env.SCENARIO_PROBABILITY ?? "0.5");
 const mode = process.env.SCENARIO_AGENT_MODE ?? "llm";
-const llmStrict = (process.env.SCENARIO_AGENT_LLM_STRICT ?? "true").toLowerCase() !== "false";
-const llmClient = mode === "llm" ? loadLlmClientFromEnv() : null;
+const llmStrict = (process.env.SCENARIO_AGENT_LLM_STRICT ?? "false").toLowerCase() !== "false";
+const llmClient = (() => {
+  if (mode !== "llm") {
+    return null;
+  }
+  try {
+    return loadLlmClientFromEnv();
+  } catch (error) {
+    if (llmStrict) {
+      throw error;
+    }
+    console.warn("[scenario-agent] llm init failed; using heuristic mode fallback", error);
+    return null;
+  }
+})();
 const app = Fastify({ logger: true });
 const pool = createDatabasePool();
 
@@ -524,7 +537,7 @@ async function tick() {
       }
 
       let proposal: ScenarioPathProposal;
-      if (mode === "llm") {
+      if (mode === "llm" && llmClient) {
         try {
           proposal = await buildScenarioProposalLlm(run.id, worldStates, directHypotheses);
         } catch (error) {

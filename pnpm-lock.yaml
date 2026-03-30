@@ -287,6 +287,12 @@ importers:
         specifier: ^5.3.2
         version: 5.8.2
 
+  services/trade-simulator:
+    dependencies:
+      fastify:
+        specifier: ^5.3.2
+        version: 5.8.2
+
   services/world-input:
     dependencies:
       '@automakit/persistence':
@@ -298,6 +304,9 @@ importers:
       fastify:
         specifier: ^5.3.2
         version: 5.8.2
+      undici:
+        specifier: ^7.24.6
+        version: 7.24.6
 
   services/world-model:
     dependencies:
@@ -1040,6 +1049,10 @@ packages:
   undici-types@7.16.0:
     resolution: {integrity: sha512-Zz+aZWSj8LE6zoxD+xrjh4VfkIG8Ya6LvYkZqtUQGJPZjYl53ypCaUwWqo7eI0x66KBGeRo+mlBEkMSeSZ38Nw==}
 
+  undici@7.24.6:
+    resolution: {integrity: sha512-Xi4agocCbRzt0yYMZGMA6ApD7gvtUFaxm4ZmeacWI4cZxaF6C+8I8QfofC20NAePiB/IcvZmzkJ7XPa471AEtA==}
+    engines: {node: '>=20.18.1'}
+
   ws@8.20.0:
     resolution: {integrity: sha512-sAt8BhgNbzCtgGbt2OxmpuryO63ZoDk/sqaB/znQm94T4fCEsy/yV+7CdC1kJhOU9lboAEU7R3kquuycDoibVA==}
     engines: {node: '>=10.0.0'}
@@ -1653,6 +1666,8 @@ snapshots:
   typescript@5.9.3: {}
 
   undici-types@7.16.0: {}
+
+  undici@7.24.6: {}
 
   ws@8.20.0: {}
 

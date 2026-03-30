@@ -1,6 +1,7 @@
 import { Pool } from "pg";
 
 const defaultDatabaseUrl = "postgres://postgres:postgres@127.0.0.1:5432/automakit";
+const schemaLockKey = 4_289_101;
 
 export function getDatabaseUrl() {
   return process.env.DATABASE_URL ?? defaultDatabaseUrl;
@@ -89,7 +90,9 @@ export function createDatabasePool() {
 }
 
 export async function ensureCoreSchema(pool: Pool) {
-  await pool.query(`
+  await pool.query("SELECT pg_advisory_lock($1)", [schemaLockKey]);
+  try {
+    await pool.query(`
     CREATE TABLE IF NOT EXISTS agents (
       id TEXT PRIMARY KEY,
       developer_id TEXT NOT NULL,
@@ -579,7 +582,10 @@ export async function ensureCoreSchema(pool: Pool) {
     ALTER TABLE simulation_runs ADD COLUMN IF NOT EXISTS last_updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
     ALTER TABLE scenario_path_proposals ADD COLUMN IF NOT EXISTS path_hypotheses JSONB NOT NULL DEFAULT '[]'::jsonb;
     ALTER TABLE synthesized_beliefs ADD COLUMN IF NOT EXISTS belief_dedupe_key TEXT;
-  `);
+    `);
+  } finally {
+    await pool.query("SELECT pg_advisory_unlock($1)", [schemaLockKey]).catch(() => undefined);
+  }
 }
 
 export function toIsoTimestamp(value: unknown) {

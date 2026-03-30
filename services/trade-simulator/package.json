@@ -1,5 +1,5 @@
 {
-  "name": "@automakit/world-input",
+  "name": "@automakit/trade-simulator",
   "private": true,
   "version": "0.1.0",
   "type": "module",
@@ -10,9 +10,6 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@automakit/persistence": "workspace:*",
-    "@automakit/world-sim": "workspace:*",
-    "fastify": "^5.3.2",
-    "undici": "^7.24.6"
+    "fastify": "^5.3.2"
   }
 }

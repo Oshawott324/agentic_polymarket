@@ -49,8 +49,8 @@ type ResolutionCollectionJobRow = {
 const port = Number(process.env.RESOLUTION_COLLECTOR_PORT ?? 4008);
 const app = Fastify({ logger: true });
 const pool = createDatabasePool();
-const marketServiceUrl = process.env.MARKET_SERVICE_URL ?? "http://localhost:4003";
-const resolutionServiceUrl = process.env.RESOLUTION_SERVICE_URL ?? "http://localhost:4006";
+const marketServiceUrl = process.env.MARKET_SERVICE_URL ?? "http://127.0.0.1:4003";
+const resolutionServiceUrl = process.env.RESOLUTION_SERVICE_URL ?? "http://127.0.0.1:4006";
 const collectorAgentId = process.env.COLLECTOR_AGENT_ID ?? "resolver-alpha";
 const intervalMs = Number(process.env.RESOLUTION_COLLECTOR_INTERVAL_MS ?? 2000);
 const batchSize = Number(process.env.RESOLUTION_COLLECTOR_BATCH_SIZE ?? 10);
@@ -111,7 +111,23 @@ async function ensureJobsForCandidates(candidates: ResolutionCandidate[]) {
           created_at,
           updated_at
         )
-        VALUES ($1, $2, $3, 'pending', $4::timestamptz, NULL, NULL, 0, NULL, $4::timestamptz, $4::timestamptz)
+        SELECT
+          $1,
+          $2,
+          $3,
+          'pending',
+          $4::timestamptz,
+          NULL,
+          NULL,
+          0,
+          NULL,
+          $4::timestamptz,
+          $4::timestamptz
+        WHERE EXISTS (
+          SELECT 1
+          FROM markets
+          WHERE id = $2
+        )
         ON CONFLICT (market_id, collector_agent_id) DO NOTHING
       `,
       [randomUUID(), candidate.market_id, collectorAgentId, now],
@@ -342,6 +358,19 @@ async function tick() {
   }
 }
 
+async function waitForService(serviceName: string, serviceUrl: string) {
+  for (;;) {
+    try {
+      const response = await fetch(`${serviceUrl}/health`);
+      if (response.ok) {
+        return;
+      }
+    } catch {}
+    app.log.info({ service: serviceName, service_url: serviceUrl }, "waiting_for_service_health");
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+}
+
 app.get("/health", async () => ({
   service: "resolution-collector",
   status: "ok",
@@ -353,6 +382,8 @@ app.get("/health", async () => ({
 async function start() {
   await ensureCoreSchema(pool);
   await app.listen({ port, host: "0.0.0.0" });
+  await waitForService("market-service", marketServiceUrl);
+  await waitForService("resolution-service", resolutionServiceUrl);
   void tick();
   setInterval(() => {
     void tick();

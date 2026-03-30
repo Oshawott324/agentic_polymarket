@@ -103,8 +103,21 @@ const batchSize = Number(process.env.WORLD_MODEL_BATCH_SIZE ?? 10);
 const agentId = process.env.WORLD_MODEL_AGENT_ID ?? "world-model-alpha";
 const agentProfile = process.env.WORLD_MODEL_AGENT_PROFILE ?? "macro";
 const mode = process.env.WORLD_MODEL_MODE ?? "llm";
-const llmStrict = (process.env.WORLD_MODEL_LLM_STRICT ?? "true").toLowerCase() !== "false";
-const llmClient = mode === "llm" ? loadLlmClientFromEnv() : null;
+const llmStrict = (process.env.WORLD_MODEL_LLM_STRICT ?? "false").toLowerCase() !== "false";
+const llmClient = (() => {
+  if (mode !== "llm") {
+    return null;
+  }
+  try {
+    return loadLlmClientFromEnv();
+  } catch (error) {
+    if (llmStrict) {
+      throw error;
+    }
+    console.warn("[world-model] llm init failed; using heuristic mode fallback", error);
+    return null;
+  }
+})();
 const app = Fastify({ logger: true });
 const pool = createDatabasePool();
 
@@ -325,6 +338,10 @@ function buildPriceThresholdSpec(signal: WorldSignal): ResolutionSpec | null {
       : "gt";
   const canonicalSourceUrl =
     typeof signal.payload.canonical_source_url === "string" ? signal.payload.canonical_source_url : undefined;
+  const observationPricePath =
+    typeof signal.payload.observation_price_path === "string" && signal.payload.observation_price_path.trim().length > 0
+      ? signal.payload.observation_price_path.trim()
+      : "price";
 
   if (!assetSymbol || !Number.isFinite(threshold) || !canonicalSourceUrl) {
     return null;
@@ -340,7 +357,7 @@ function buildPriceThresholdSpec(signal: WorldSignal): ResolutionSpec | null {
     observation_schema: {
       type: "object",
       fields: {
-        price: { type: "number", path: "price" },
+        price: { type: "number", path: observationPricePath },
         observed_at: { type: "string", path: "observed_at", required: false },
       },
     },
@@ -783,7 +800,7 @@ async function processRun(runId: string, triggerSignalIds: string[]) {
       }
     | undefined;
 
-  if (mode === "llm") {
+  if (mode === "llm" && llmClient) {
     try {
       output = await generateWithLlm(runId, triggerSignalIds, signals);
     } catch (error) {

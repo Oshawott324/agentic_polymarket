@@ -59,11 +59,19 @@ type ApprovalVoteRow = {
 };
 
 const port = Number(process.env.APPROVAL_AGENT_PORT ?? 4014);
-const agentId = process.env.APPROVAL_AGENT_ID ?? "approval-core";
+const configuredAgentIds = (process.env.APPROVAL_AGENT_IDS ?? process.env.APPROVAL_AGENT_ID ?? "approval-alpha,approval-beta,approval-gamma")
+  .split(",")
+  .map((entry) => entry.trim())
+  .filter(Boolean);
+const approvalAgentIds = [...new Set(configuredAgentIds)];
+const fallbackQuorum = Math.max(1, Math.min(approvalAgentIds.length, 2));
 const intervalMs = Number(process.env.APPROVAL_AGENT_INTERVAL_MS ?? 1000);
 const batchSize = Number(process.env.APPROVAL_AGENT_BATCH_SIZE ?? 20);
-const quorumRequired = Math.max(1, Number(process.env.APPROVAL_QUORUM_REQUIRED ?? 3));
-const minApprovals = Math.max(1, Number(process.env.APPROVAL_MIN_APPROVALS ?? 2));
+const quorumRequired = Math.max(1, Number(process.env.APPROVAL_QUORUM_REQUIRED ?? fallbackQuorum));
+const minApprovals = Math.min(
+  quorumRequired,
+  Math.max(1, Number(process.env.APPROVAL_MIN_APPROVALS ?? fallbackQuorum)),
+);
 const maxAmbiguity = Math.min(1, Math.max(0, Number(process.env.APPROVAL_MAX_AMBIGUITY ?? 0.35)));
 const minResolvability = Math.min(1, Math.max(0, Number(process.env.APPROVAL_MIN_RESOLVABILITY ?? 0.65)));
 const maxManipulationRisk = Math.min(1, Math.max(0, Number(process.env.APPROVAL_MAX_MANIPULATION_RISK ?? 0.45)));
@@ -279,6 +287,7 @@ async function insertVote(
   approvalCase: ReturnType<typeof mapApprovalCaseRow>,
   belief: SynthesizedBelief,
   decision: ReturnType<typeof decideVote>,
+  approvalAgentId: string,
 ) {
   await client.query(
     `
@@ -303,7 +312,7 @@ async function insertVote(
       approvalCase.id,
       belief.id,
       belief.run_id,
-      agentId,
+      approvalAgentId,
       decision.decision,
       decision.resolvabilityScore,
       decision.ambiguityScore,
@@ -407,12 +416,14 @@ async function processBelief(belief: SynthesizedBelief) {
       return;
     }
 
-    const decision = decideVote({
-      belief,
-      resolutionSpec,
-      validationErrors: validation.ok ? [] : validation.errors,
-    });
-    await insertVote(client, approvalCase, belief, decision);
+    for (const approvalAgentId of approvalAgentIds) {
+      const decision = decideVote({
+        belief,
+        resolutionSpec,
+        validationErrors: validation.ok ? [] : validation.errors,
+      });
+      await insertVote(client, approvalCase, belief, decision, approvalAgentId);
+    }
     const updatedCase = await reconcileCase(client, approvalCase.id);
 
     app.log.info(
@@ -464,7 +475,9 @@ async function tick() {
 app.get("/health", async () => ({
   service: "approval-agent",
   status: "ok",
-  agent_id: agentId,
+  agent_ids: approvalAgentIds,
+  quorum_required: quorumRequired,
+  min_approvals: minApprovals,
   last_tick_at: lastTickAt,
   last_tick_error: lastTickError,
 }));
@@ -509,6 +522,9 @@ app.post("/v1/internal/approval-agent/run-once", async () => {
 });
 
 async function start() {
+  if (approvalAgentIds.length === 0) {
+    throw new Error("approval_agent_ids_required");
+  }
   for (let attempt = 0; attempt < 20; attempt += 1) {
     try {
       await ensureCoreSchema(pool);

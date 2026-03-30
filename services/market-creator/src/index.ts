@@ -2,9 +2,10 @@ import { createHash } from "node:crypto";
 import type { MarketSignal } from "@automakit/sdk-types";
 import { loadSignals } from "./signals.js";
 
-const proposalPipelineUrl = process.env.PROPOSAL_PIPELINE_URL ?? "http://localhost:4005";
+const proposalPipelineUrl = process.env.PROPOSAL_PIPELINE_URL ?? "http://127.0.0.1:4005";
 const loopIntervalMs = Number(process.env.MARKET_CREATOR_INTERVAL_MS ?? 15_000);
 const automationAgentId = process.env.MARKET_CREATOR_AGENT_ID ?? "automation-market-creator";
+const marketCreatorEnabled = (process.env.MARKET_CREATOR_ENABLED ?? "false").toLowerCase() !== "false";
 
 function dedupeKeyFor(signal: MarketSignal) {
   return createHash("sha256")
@@ -87,6 +88,10 @@ console.log(
 );
 
 void (async () => {
+  if (!marketCreatorEnabled) {
+    console.log("[market-creator] disabled; relying on world-input + simulation + proposal agents");
+    return;
+  }
   await waitForProposalPipeline();
   await runLoop();
   setInterval(() => {

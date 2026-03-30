@@ -24,6 +24,7 @@ services/
   simulation-orchestrator/
   simulation-runtime-py/
   stream-service/
+  trade-simulator/
   synthesis-agent/
   world-input/
   world-model/
@@ -56,12 +57,22 @@ docs/
 
 ```bash
 pnpm install
+cp .env.example .env
 pnpm dev:infra
 pnpm dev
 pnpm dev:matching-engine
 ```
 
+If external feeds are blocked on your network, set proxy env vars before `pnpm dev` so `world-input` and source fetchers can reach upstream APIs:
+
+```bash
+export HTTP_PROXY=http://127.0.0.1:7890
+export HTTPS_PROXY=http://127.0.0.1:7890
+export ALL_PROXY=http://127.0.0.1:7890
+```
+
 Core local infrastructure is defined in `infra/docker/docker-compose.yml`.
+`pnpm dev` loads `.env` automatically.
 
 To run the external Python simulation runtime boundary:
 
@@ -115,6 +126,8 @@ Core product state for agents, auth challenges, access tokens, proposals, market
 ## Current Implemented Flows
 
 - Autonomous market creation, publication, and deterministic resolution.
+- `market-creator` is disabled by default; market generation now runs through `world-input -> simulation-orchestrator -> world-model/scenario/synthesis -> approval-agent -> proposal-agent -> proposal-pipeline`.
+- Autonomous `trade-simulator` now runs belief-linked trading agents that place signed orders only on markets tied to synthesized beliefs.
 - Platform-owned `world-input`, `simulation-orchestrator`, `world-model`, `scenario-agent`, `synthesis-agent`, and `proposal-agent` services so market generation no longer depends only on external structured feeds.
 - `world-model`, `scenario-agent`, and `synthesis-agent` run with real OpenAI-compatible LLM calls by default (`LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL_NAME`).
 - Durable `world_signals`, DB-managed `world_input_sources` / `world_input_runs`, `simulation_runs`, `world_state_proposals`, `belief_hypothesis_proposals`, `scenario_path_proposals`, and `synthesized_beliefs` so market generation can bootstrap from an empty runtime and recover after restart.
@@ -141,7 +154,7 @@ The current trading path is real but still limited:
 - portfolio accounting is inventory-based and paper-trading only; there is no margin engine or shorting workflow yet.
 - stream fanout is currently DB-poll based rather than using logical replication or a broker.
 - source adapter coverage includes `http_json`, `x_api_recent_search`, `reddit_api_subreddit_new`, and `news_rss`, but broader source types are still pending.
-- there is not yet a platform-owned liquidity bootstrap agent.
+- liquidity bootstrap is currently baseline belief-driven (`trade-simulator`), not strategy-aware market making.
 
 ## Live Test
 
@@ -413,7 +426,8 @@ The next major architecture addition is a runtime split:
 - [x] Data-input parity: automatically ingest a focused X/Reddit/news signal mix with feed sources managed in database state (not only env vars).
 - [x] Simulation-engine parity: run world/simulation agents in a dedicated Python CAMEL/Oasis runtime called by `simulation-orchestrator` through versioned request/response contracts.
 - [x] Listing-quality parity: approval-agent quorum now gates proposal publication so only low-ambiguity, machine-resolvable hypotheses publish.
-- [ ] Liquidity-quality parity: add platform-owned liquidity agents to reduce cold-start empty books.
+- [x] Liquidity bootstrap baseline: platform-owned belief-linked trader agents keep books active and stream activity visible in local runtime.
+- [ ] Liquidity-quality parity: replace baseline simulator with strategy-aware market-making/liquidity agents.
 - [ ] Exchange hardening parity: add matching snapshots + reconciliation, lower-latency stream fanout, stale-token revocation, self-trade prevention, halt-aware rejects, and fuller margin/shorting.
 
 ## License
