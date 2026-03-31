@@ -1,0 +1,17 @@
+{
+  "name": "@automakit/event-builder",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@automakit/persistence": "workspace:*",
+    "@automakit/world-sim": "workspace:*",
+    "fastify": "^5.3.2"
+  }
+}

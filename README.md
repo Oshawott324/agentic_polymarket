@@ -12,6 +12,7 @@ services/
   api-gateway/
   agent-gateway/
   auth-registry/
+  event-builder/
   market-creator/
   market-service/
   matching-engine/
@@ -49,6 +50,7 @@ docs/
 - [Product Requirements Document](./docs/prd.md)
 - [System Architecture](./docs/architecture.md)
 - [Agent Automation Roadmap](./docs/roadmap-agent-automation.md)
+- [Agent Operations](./docs/agent-operations.md)
 - [Agent Simulation Fabric Spec](./docs/world-model-implementation-spec.md)
 - [OpenAPI Schema](./docs/api/openapi.yaml)
 - [Sprint 01 Plan](./docs/sprint-01-plan.md)
@@ -63,13 +65,7 @@ pnpm dev
 pnpm dev:matching-engine
 ```
 
-If external feeds are blocked on your network, set proxy env vars before `pnpm dev` so `world-input` and source fetchers can reach upstream APIs:
-
-```bash
-export HTTP_PROXY=http://127.0.0.1:7890
-export HTTPS_PROXY=http://127.0.0.1:7890
-export ALL_PROXY=http://127.0.0.1:7890
-```
+Agent runtime networking and proxy configuration is documented in [Agent Operations](./docs/agent-operations.md).
 
 Core local infrastructure is defined in `infra/docker/docker-compose.yml`.
 `pnpm dev` loads `.env` automatically.
@@ -105,12 +101,13 @@ This starts `simulation-runtime-py` (native CAMEL/Oasis mode) and then starts al
 The current autonomous market-generation loop is:
 
 1. `services/world-input` polls configured upstream sources and writes normalized `world_signals`.
-2. `services/simulation-orchestrator` creates and advances simulation runs over those signals.
-3. `services/world-model` emits `world_state_proposals` and direct `belief_hypothesis_proposals`.
-4. `services/scenario-agent` emits alternative `scenario_path_proposals`.
-5. `services/synthesis-agent` merges agent outputs into `synthesized_beliefs`.
-6. `services/proposal-agent` converts eligible synthesized beliefs into machine-resolvable proposals.
-7. `services/proposal-pipeline` validates, dedupes, scores, and publishes.
+2. `services/event-builder` deterministically clusters fresh signals into `event_cases` (facts-layer, no market logic), and ignores legacy synthetic `price_threshold` signals.
+3. `services/simulation-orchestrator` creates and advances simulation runs over those signals.
+4. `services/world-model` emits `world_state_proposals` and direct `belief_hypothesis_proposals`.
+5. `services/scenario-agent` emits alternative `scenario_path_proposals`.
+6. `services/synthesis-agent` merges agent outputs into `synthesized_beliefs`.
+7. `services/proposal-agent` converts eligible synthesized beliefs into machine-resolvable proposals.
+8. `services/proposal-pipeline` validates, dedupes, scores, and publishes.
 
 The next target loop extends this with external social feeds and an agent approval gate:
 
@@ -129,6 +126,7 @@ Core product state for agents, auth challenges, access tokens, proposals, market
 - `market-creator` is disabled by default; market generation now runs through `world-input -> simulation-orchestrator -> world-model/scenario/synthesis -> approval-agent -> proposal-agent -> proposal-pipeline`.
 - Autonomous `trade-simulator` now runs belief-linked trading agents that place signed orders only on markets tied to synthesized beliefs.
 - Platform-owned `world-input`, `simulation-orchestrator`, `world-model`, `scenario-agent`, `synthesis-agent`, and `proposal-agent` services so market generation no longer depends only on external structured feeds.
+- Platform-owned deterministic facts layer (`world-input` + `event-builder`) so source ingestion and event clustering stay schema-driven without embedded market-generation heuristics.
 - `world-model`, `scenario-agent`, and `synthesis-agent` run with real OpenAI-compatible LLM calls by default (`LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL_NAME`).
 - Durable `world_signals`, DB-managed `world_input_sources` / `world_input_runs`, `simulation_runs`, `world_state_proposals`, `belief_hypothesis_proposals`, `scenario_path_proposals`, and `synthesized_beliefs` so market generation can bootstrap from an empty runtime and recover after restart.
 - DB-backed source registry endpoints in `world-input` (`/v1/internal/world-input/sources`, `/v1/internal/world-input/sources/:id/test`, `/v1/internal/world-input/run-once`) so source management and polling are runtime state, not env-only.
@@ -186,7 +184,7 @@ pnpm live:test:streams
 - delta replay from `from_sequence` after disconnect,
 - durable stream emission from market creation, order submission, fills, cancels, and autonomous resolution updates.
 
-The simulation fabric requires LLM settings (`LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL_NAME`) plus DB-managed world-input sources. Optionally, `WORLD_INPUT_BOOTSTRAP_SOURCES_JSON` can seed source rows on first boot for local setup compatibility. The live test spins up temporary feed + mock LLM endpoints and verifies:
+The simulation fabric requires LLM settings (`LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL_NAME`) plus DB-managed world-input sources. Optionally, `WORLD_INPUT_BOOTSTRAP_SOURCES_JSON` is reconciled at `world-input` startup and upserts source rows by `key` for local setup compatibility. The live test spins up temporary feed + mock LLM endpoints and verifies:
 
 - autonomous source polling into `world_signals`,
 - autonomous simulation-run creation,

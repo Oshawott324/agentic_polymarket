@@ -5,6 +5,7 @@ import { ProxyAgent, setGlobalDispatcher } from "undici";
 import {
   buildDedupeKey,
   inferEntityRefs,
+  sourceAdapterToSignalType,
   type SourceAdapterKind,
   type TrustTier,
   type WorldEntityRef,
@@ -174,28 +175,6 @@ function readPath(root: unknown, path: string) {
   return current;
 }
 
-function clampNumber(value: number, min: number, max: number) {
-  return Math.max(min, Math.min(max, value));
-}
-
-function formatUtcDay(value: string) {
-  return value.slice(0, 10);
-}
-
-function operatorPhrase(operator: "gt" | "gte" | "lt" | "lte") {
-  switch (operator) {
-    case "gte":
-      return "at or above";
-    case "gt":
-      return "above";
-    case "lte":
-      return "at or below";
-    case "lt":
-    default:
-      return "below";
-  }
-}
-
 function normalizeTimestamp(value: unknown): string | null {
   if (typeof value !== "string" || value.length === 0) {
     return null;
@@ -266,27 +245,6 @@ function sourceKindFromAdapter(adapter: WorldInputAdapterKind): string {
       return "internal";
     default:
       return "external";
-  }
-}
-
-function worldSignalTypeFromAdapter(adapter: WorldInputAdapterKind): WorldSignal["source_type"] {
-  switch (adapter) {
-    case "http_json_calendar":
-      return "economic_calendar";
-    case "http_json_price":
-      return "price_feed";
-    case "http_json_filing":
-      return "filing";
-    case "http_json_official_announcement":
-      return "official_announcement";
-    case "market_internal":
-      return "market_internal";
-    case "x_api_recent_search":
-    case "reddit_api_subreddit_new":
-    case "news_rss":
-      return "news";
-    default:
-      return "news";
   }
 }
 
@@ -530,7 +488,7 @@ function normalizeSignalFromItem(source: SourceWithConfig, item: Record<string, 
   );
   const signal: WorldSignal = {
     id: randomUUID(),
-    source_type: worldSignalTypeFromAdapter(source.adapter),
+    source_type: sourceAdapterToSignalType(source.adapter),
     source_adapter: source.adapter as WorldSignal["source_adapter"],
     source_id: sourceId,
     source_url: sourceUrl,
@@ -819,15 +777,6 @@ function expandHttpJsonPriceItems(source: SourceWithConfig, items: Record<string
   }
 
   const config = source.config_json;
-  const generationMode =
-    asString(config.market_generation_mode) ??
-    asString(config.market_mode) ??
-    "price_threshold_auto";
-
-  if (generationMode !== "price_threshold_auto") {
-    return items;
-  }
-
   const pricePath = asString(config.price_path) ?? "price";
   const rawPrice = readPath(items[0], pricePath);
   const currentPrice = asNumber(rawPrice);
@@ -837,53 +786,42 @@ function expandHttpJsonPriceItems(source: SourceWithConfig, items: Record<string
 
   const assetSymbol = (asString(config.asset_symbol) ?? asString(config.symbol) ?? "ASSET").toUpperCase();
   const quoteSymbol = (asString(config.quote_symbol) ?? "USD").toUpperCase();
-  const category = asString(config.category) ?? "crypto";
-  const operatorRaw = asString(config.operator);
-  const operator: "gt" | "gte" | "lt" | "lte" =
-    operatorRaw === "gt" || operatorRaw === "lte" || operatorRaw === "lt"
-      ? operatorRaw
-      : "gte";
-  const thresholdPercent = clampNumber(asNumber(config.threshold_percent) ?? 3, 0.25, 25);
-  const thresholdRoundTo = Math.max(0.01, asNumber(config.threshold_round_to) ?? 100);
-  const horizonHours = clampNumber(asNumber(config.market_horizon_hours) ?? 24, 1, 24 * 14);
-  const windowMinutes = clampNumber(asNumber(config.market_window_minutes) ?? 60, 5, 24 * 60);
+  const category = asString(config.category) ?? "asset";
+  const roundDecimals = Math.max(0, Math.min(8, Number(asNumber(config.price_round_decimals) ?? 2)));
+  const roundedPrice = Number(currentPrice.toFixed(roundDecimals));
   const canonicalSourceUrl = asString(config.canonical_source_url) ?? source.source_url;
   if (!canonicalSourceUrl) {
     throw new Error(`world_input_source_canonical_url_missing:${source.key}`);
   }
 
-  const direction = operator === "lt" || operator === "lte" ? -1 : 1;
-  const thresholdBase = currentPrice * (1 + direction * thresholdPercent / 100);
-  const threshold = Math.max(
-    thresholdRoundTo,
-    Math.round(thresholdBase / thresholdRoundTo) * thresholdRoundTo,
-  );
-
-  const now = Date.now();
-  const targetMs = now + horizonHours * 60 * 60 * 1000;
-  const windowMs = windowMinutes * 60 * 1000;
-  const targetBucketMs = Math.floor(targetMs / windowMs) * windowMs;
-  const targetTime = new Date(targetBucketMs).toISOString();
-  const dateLabel = formatUtcDay(targetTime);
-  const thresholdLabel = Math.round(threshold).toLocaleString("en-US");
-  const sourceId = `${assetSymbol.toLowerCase()}-${operator}-${Math.round(threshold)}-${targetBucketMs}`;
-  const title = `Will ${assetSymbol} be ${operatorPhrase(operator)} $${thresholdLabel} by ${dateLabel} UTC?`;
+  const observedAtPath = asString(config.observed_at_path);
+  const observedAt =
+    (observedAtPath ? normalizeTimestamp(readPath(items[0], observedAtPath)) : null) ??
+    normalizeTimestamp((items[0] as Record<string, unknown>).observed_at) ??
+    normalizeTimestamp((items[0] as Record<string, unknown>).timestamp) ??
+    new Date().toISOString();
+  const minuteBucket = Math.floor(new Date(observedAt).getTime() / 60_000);
+  const scaledPrice = Math.round(roundedPrice * Math.pow(10, Math.min(6, roundDecimals)));
+  const sourceId = `${assetSymbol.toLowerCase()}-${quoteSymbol.toLowerCase()}-${scaledPrice}-${minuteBucket}`;
+  const title = `${assetSymbol}/${quoteSymbol} spot price observed`;
+  const formattedPrice = new Intl.NumberFormat("en-US", {
+    maximumFractionDigits: roundDecimals,
+  }).format(roundedPrice);
 
   return [
     {
       source_id: sourceId,
       source_url: source.source_url ?? canonicalSourceUrl,
       title,
-      summary: `${assetSymbol} ${quoteSymbol} signal from ${source.key}. Current ${Math.round(currentPrice).toLocaleString("en-US")}; threshold ${operatorPhrase(operator)} ${thresholdLabel} by ${dateLabel} UTC.`,
-      effective_at: targetTime,
+      summary: `${assetSymbol}/${quoteSymbol} observed at ${formattedPrice} from ${source.key}.`,
+      effective_at: observedAt,
       payload: {
-        kind: "price_threshold",
+        kind: "asset_price_observation",
         category,
         asset_symbol: assetSymbol,
         quote_symbol: quoteSymbol,
-        operator,
-        threshold,
-        target_time: targetTime,
+        price: roundedPrice,
+        observed_at: observedAt,
         canonical_source_url: canonicalSourceUrl,
         observation_price_path: pricePath,
       },
@@ -1047,14 +985,9 @@ async function pollSource(source: SourceWithConfig) {
 }
 
 async function maybeBootstrapSourcesFromEnv() {
-  const countResult = await pool.query<{ count: string }>("SELECT COUNT(*) AS count FROM world_input_sources");
-  const count = Number(countResult.rows[0]?.count ?? 0);
-  if (count > 0) {
-    return 0;
-  }
-
   const candidates = parseBootstrapSourceConfigs();
   let inserted = 0;
+  let updated = 0;
   for (const candidate of candidates) {
     if (!candidate || typeof candidate !== "object") {
       continue;
@@ -1069,7 +1002,7 @@ async function maybeBootstrapSourcesFromEnv() {
     const source = validation.config;
     const configJson = configWithoutKnownKeys(entry);
     const authSecretRef = asString(entry.auth_secret_ref);
-    await pool.query(
+    const upsertResult = await pool.query<{ inserted: boolean }>(
       `
         INSERT INTO world_input_sources (
           id,
@@ -1095,7 +1028,22 @@ async function maybeBootstrapSourcesFromEnv() {
         VALUES (
           $1, $2, $3, $4, 'active', TRUE, $5, $6, $7, $8::jsonb, $9, NULL, NULL, NOW(), NULL, 0, NULL, NOW(), NOW()
         )
-        ON CONFLICT (key) DO NOTHING
+        ON CONFLICT (key) DO UPDATE SET
+          adapter = EXCLUDED.adapter,
+          kind = EXCLUDED.kind,
+          status = EXCLUDED.status,
+          enabled = EXCLUDED.enabled,
+          poll_interval_seconds = EXCLUDED.poll_interval_seconds,
+          source_url = EXCLUDED.source_url,
+          trust_tier = EXCLUDED.trust_tier,
+          config_json = EXCLUDED.config_json,
+          auth_secret_ref = EXCLUDED.auth_secret_ref,
+          next_poll_at = NOW(),
+          backoff_until = NULL,
+          failure_count = 0,
+          last_error = NULL,
+          updated_at = NOW()
+        RETURNING (xmax = 0) AS inserted
       `,
       [
         randomUUID(),
@@ -1109,13 +1057,20 @@ async function maybeBootstrapSourcesFromEnv() {
         authSecretRef,
       ],
     );
-    inserted += 1;
+
+    if ((upsertResult.rowCount ?? 0) > 0) {
+      if (upsertResult.rows[0]?.inserted) {
+        inserted += 1;
+      } else {
+        updated += 1;
+      }
+    }
   }
 
-  if (inserted > 0) {
-    app.log.info({ inserted }, "bootstrapped_world_input_sources");
+  if (inserted > 0 || updated > 0) {
+    app.log.info({ inserted, updated }, "reconciled_world_input_sources_from_bootstrap");
   }
-  return inserted;
+  return inserted + updated;
 }
 
 async function fetchSourceById(sourceId: string) {

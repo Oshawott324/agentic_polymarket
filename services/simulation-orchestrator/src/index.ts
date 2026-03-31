@@ -171,6 +171,10 @@ async function fetchLatestSignals(limit: number) {
     `
       SELECT id, dedupe_key, created_at
       FROM world_signals
+      WHERE NOT (
+        source_type = 'price_feed'
+        AND COALESCE(payload->>'kind', '') = 'price_threshold'
+      )
       ORDER BY created_at DESC, id DESC
       LIMIT $1
     `,
@@ -190,6 +194,10 @@ async function fetchSignalsByIds(signalIds: string[]) {
       SELECT *
       FROM world_signals
       WHERE id = ANY($1::text[])
+        AND NOT (
+          source_type = 'price_feed'
+          AND COALESCE(payload->>'kind', '') = 'price_threshold'
+        )
       ORDER BY created_at ASC, id ASC
     `,
     [signalIds],

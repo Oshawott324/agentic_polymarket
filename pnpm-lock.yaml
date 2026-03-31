@@ -146,6 +146,18 @@ importers:
         specifier: ^5.3.2
         version: 5.8.2
 
+  services/event-builder:
+    dependencies:
+      '@automakit/persistence':
+        specifier: workspace:*
+        version: link:../../packages/persistence
+      '@automakit/world-sim':
+        specifier: workspace:*
+        version: link:../../packages/world-sim
+      fastify:
+        specifier: ^5.3.2
+        version: 5.8.2
+
   services/market-creator:
     dependencies:
       '@automakit/sdk-types':

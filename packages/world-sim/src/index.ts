@@ -43,6 +43,25 @@ export type WorldSignal = {
   created_at: string;
 };
 
+export type EventCaseStatus = "open" | "stale" | "closed";
+
+export type EventCase = {
+  id: string;
+  fingerprint: string;
+  kind: string;
+  title: string;
+  summary: string;
+  primary_entity: string;
+  source_types: WorldSignalSourceType[];
+  source_adapters: SourceAdapterKind[];
+  signal_count: number;
+  first_signal_at: string;
+  last_signal_at: string;
+  status: EventCaseStatus;
+  created_at: string;
+  updated_at: string;
+};
+
 export type WorldInputCursor = {
   source_key: string;
   cursor_value: string | null;
@@ -343,6 +362,52 @@ export function validateWorldSignal(signal: unknown) {
   return errors.length > 0
     ? { ok: false as const, errors }
     : { ok: true as const, signal: candidate as WorldSignal };
+}
+
+export function validateEventCase(eventCase: unknown) {
+  const errors: string[] = [];
+  if (!eventCase || typeof eventCase !== "object") {
+    return { ok: false as const, errors: ["event_case_must_be_object"] };
+  }
+
+  const candidate = eventCase as Partial<EventCase>;
+  if (!candidate.id) {
+    errors.push("event_case_id_required");
+  }
+  if (!candidate.fingerprint) {
+    errors.push("event_case_fingerprint_required");
+  }
+  if (!candidate.kind) {
+    errors.push("event_case_kind_required");
+  }
+  if (!candidate.title) {
+    errors.push("event_case_title_required");
+  }
+  if (!candidate.primary_entity) {
+    errors.push("event_case_primary_entity_required");
+  }
+  if (!Array.isArray(candidate.source_types) || candidate.source_types.length === 0) {
+    errors.push("event_case_source_types_required");
+  }
+  if (!Array.isArray(candidate.source_adapters) || candidate.source_adapters.length === 0) {
+    errors.push("event_case_source_adapters_required");
+  }
+  if (typeof candidate.signal_count !== "number" || !Number.isFinite(candidate.signal_count) || candidate.signal_count < 1) {
+    errors.push("event_case_signal_count_invalid");
+  }
+  if (!candidate.first_signal_at) {
+    errors.push("event_case_first_signal_at_required");
+  }
+  if (!candidate.last_signal_at) {
+    errors.push("event_case_last_signal_at_required");
+  }
+  if (!candidate.status || !["open", "stale", "closed"].includes(candidate.status)) {
+    errors.push("event_case_status_invalid");
+  }
+
+  return errors.length > 0
+    ? { ok: false as const, errors }
+    : { ok: true as const, eventCase: candidate as EventCase };
 }
 
 function isResolutionKind(value: unknown): value is ResolutionKind {

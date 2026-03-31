@@ -167,16 +167,36 @@ export async function ensureCoreSchema(pool: Pool) {
     CREATE INDEX IF NOT EXISTS idx_world_signals_created
       ON world_signals (created_at DESC);
 
-    CREATE TABLE IF NOT EXISTS world_input_cursors (
-      source_key TEXT PRIMARY KEY,
-      cursor_value TEXT,
-      last_polled_at TIMESTAMPTZ,
-      next_poll_at TIMESTAMPTZ NOT NULL,
-      backoff_until TIMESTAMPTZ,
-      failure_count INTEGER NOT NULL DEFAULT 0,
-      last_error TEXT,
+    CREATE TABLE IF NOT EXISTS event_cases (
+      id TEXT PRIMARY KEY,
+      fingerprint TEXT NOT NULL UNIQUE,
+      kind TEXT NOT NULL,
+      title TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      primary_entity TEXT NOT NULL,
+      source_types JSONB NOT NULL,
+      source_adapters JSONB NOT NULL,
+      signal_count INTEGER NOT NULL,
+      first_signal_at TIMESTAMPTZ NOT NULL,
+      last_signal_at TIMESTAMPTZ NOT NULL,
+      status TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL,
       updated_at TIMESTAMPTZ NOT NULL
     );
+
+    CREATE INDEX IF NOT EXISTS idx_event_cases_status_last_signal
+      ON event_cases (status, last_signal_at DESC);
+
+    CREATE TABLE IF NOT EXISTS event_case_signals (
+      event_case_id TEXT NOT NULL REFERENCES event_cases(id) ON DELETE CASCADE,
+      signal_id TEXT NOT NULL REFERENCES world_signals(id) ON DELETE CASCADE,
+      role TEXT NOT NULL,
+      added_at TIMESTAMPTZ NOT NULL,
+      PRIMARY KEY (event_case_id, signal_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_event_case_signals_signal
+      ON event_case_signals (signal_id);
 
     CREATE TABLE IF NOT EXISTS world_input_sources (
       id TEXT PRIMARY KEY,
