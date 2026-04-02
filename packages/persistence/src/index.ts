@@ -133,6 +133,7 @@ export async function ensureCoreSchema(pool: Pool) {
       resolution_kind TEXT NOT NULL,
       resolution_metadata JSONB NOT NULL,
       dedupe_key TEXT NOT NULL UNIQUE,
+      semantic_dedupe_key TEXT,
       origin TEXT NOT NULL,
       signal_source_id TEXT,
       signal_source_type TEXT,
@@ -321,6 +322,10 @@ export async function ensureCoreSchema(pool: Pool) {
       source_signal_ids JSONB NOT NULL,
       machine_resolvable BOOLEAN NOT NULL,
       suggested_resolution_spec JSONB,
+      event_case_id TEXT,
+      case_family_key TEXT,
+      belief_role TEXT,
+      publishability_score DOUBLE PRECISION,
       dedupe_key TEXT NOT NULL,
       created_at TIMESTAMPTZ NOT NULL,
       UNIQUE (run_id, agent_id, dedupe_key)
@@ -597,6 +602,7 @@ export async function ensureCoreSchema(pool: Pool) {
     ALTER TABLE orders ADD COLUMN IF NOT EXISTS filled_size DOUBLE PRECISION NOT NULL DEFAULT 0;
     ALTER TABLE orders ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
     ALTER TABLE proposals ADD COLUMN IF NOT EXISTS resolution_spec JSONB NOT NULL DEFAULT '{}'::jsonb;
+    ALTER TABLE proposals ADD COLUMN IF NOT EXISTS semantic_dedupe_key TEXT;
     ALTER TABLE markets ADD COLUMN IF NOT EXISTS resolution_spec JSONB NOT NULL DEFAULT '{}'::jsonb;
     ALTER TABLE observations ADD COLUMN IF NOT EXISTS parser_version TEXT NOT NULL DEFAULT 'resolution-runtime@1';
     ALTER TABLE simulation_runs ADD COLUMN IF NOT EXISTS trigger_dedupe_key TEXT;
@@ -604,6 +610,14 @@ export async function ensureCoreSchema(pool: Pool) {
     ALTER TABLE simulation_runs ADD COLUMN IF NOT EXISTS trigger_event_case_ids JSONB NOT NULL DEFAULT '[]'::jsonb;
     ALTER TABLE scenario_path_proposals ADD COLUMN IF NOT EXISTS path_hypotheses JSONB NOT NULL DEFAULT '[]'::jsonb;
     ALTER TABLE synthesized_beliefs ADD COLUMN IF NOT EXISTS belief_dedupe_key TEXT;
+    ALTER TABLE belief_hypothesis_proposals ADD COLUMN IF NOT EXISTS event_case_id TEXT;
+    ALTER TABLE belief_hypothesis_proposals ADD COLUMN IF NOT EXISTS case_family_key TEXT;
+    ALTER TABLE belief_hypothesis_proposals ADD COLUMN IF NOT EXISTS belief_role TEXT;
+    ALTER TABLE belief_hypothesis_proposals ADD COLUMN IF NOT EXISTS publishability_score DOUBLE PRECISION;
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_proposals_semantic_dedupe_key
+      ON proposals (semantic_dedupe_key)
+      WHERE semantic_dedupe_key IS NOT NULL;
     `);
   } finally {
     await pool.query("SELECT pg_advisory_unlock($1)", [schemaLockKey]).catch(() => undefined);

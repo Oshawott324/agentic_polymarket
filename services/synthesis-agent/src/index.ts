@@ -10,6 +10,17 @@ import {
   validateSynthesizedBelief,
 } from "@automakit/world-sim";
 
+type CaseAwareBeliefHypothesisProposal = BeliefHypothesisProposal & {
+  event_case_id?: string | null;
+  case_family_key?: string | null;
+  belief_role?: "primary" | "secondary";
+  publishability_score?: number;
+};
+
+type CaseAwareSynthesizedBelief = Omit<SynthesizedBelief, "hypothesis"> & {
+  hypothesis: CaseAwareBeliefHypothesisProposal;
+};
+
 type SimulationRunRow = {
   id: string;
   status: SimulationRunStatus;
@@ -31,6 +42,10 @@ type BeliefHypothesisProposalRow = {
   source_signal_ids: unknown;
   machine_resolvable: boolean;
   suggested_resolution_spec: unknown;
+  event_case_id: string | null;
+  case_family_key: string | null;
+  belief_role: "primary" | "secondary" | null;
+  publishability_score: unknown;
   dedupe_key: string;
   created_at: unknown;
 };
@@ -67,39 +82,55 @@ type SynthesizedBeliefRow = {
 };
 
 type SynthesisLlmResponse = {
-  beliefs: Array<{
+  beliefs?: Array<{
     key: string;
-    agreement_score: number;
-    disagreement_score: number;
-    confidence_score: number;
-    status: SynthesizedBelief["status"];
+    agreement_score?: number;
+    disagreement_score?: number;
+    confidence_score?: number;
+    status?: SynthesizedBelief["status"] | string;
     conflict_notes?: string | null;
     suppression_reason?: string | null;
-    reasoning_summary: string;
+    reasoning_summary?: string;
+  }>;
+  results?: Array<{
+    key: string;
+    agreement?: number;
+    disagreement?: number;
+    confidence?: number;
+    status?: string;
+    conflict_notes?: string | null;
+    suppression_reason?: string | null;
+    reasoning?: string;
+  }>;
+  candidates?: Array<{
+    key: string;
+    agreement_score?: number;
+    disagreement_score?: number;
+    confidence_score?: number;
+    agreement?: number;
+    disagreement?: number;
+    confidence?: number;
+    status?: string;
+    conflict_notes?: string | null;
+    suppression_reason?: string | null;
+    reasoning_summary?: string;
+    reasoning?: string;
   }>;
 };
 
 const port = Number(process.env.SYNTHESIS_AGENT_PORT ?? 4015);
 const intervalMs = Number(process.env.SYNTHESIS_AGENT_INTERVAL_MS ?? 1000);
 const batchSize = Number(process.env.SYNTHESIS_AGENT_BATCH_SIZE ?? 10);
+const runConcurrency = Math.max(1, Number(process.env.SYNTHESIS_AGENT_RUN_CONCURRENCY ?? 4));
 const agentId = process.env.SYNTHESIS_AGENT_ID ?? "synthesis-core";
 const minConfidenceForNew = Math.max(0, Math.min(1, Number(process.env.SYNTHESIS_MIN_CONFIDENCE_FOR_NEW ?? 0.52)));
 const maxDisagreementForNew = Math.max(0, Math.min(1, Number(process.env.SYNTHESIS_MAX_DISAGREEMENT_FOR_NEW ?? 0.35)));
 const mode = process.env.SYNTHESIS_AGENT_MODE ?? "llm";
-const llmStrict = (process.env.SYNTHESIS_AGENT_LLM_STRICT ?? "false").toLowerCase() !== "false";
 const llmClient = (() => {
   if (mode !== "llm") {
     return null;
   }
-  try {
-    return loadLlmClientFromEnv();
-  } catch (error) {
-    if (llmStrict) {
-      throw error;
-    }
-    console.warn("[synthesis-agent] llm init failed; using heuristic mode fallback", error);
-    return null;
-  }
+  return loadLlmClientFromEnv();
 })();
 const app = Fastify({ logger: true });
 const pool = createDatabasePool();
@@ -108,7 +139,25 @@ let tickInFlight = false;
 let lastTickAt: string | null = null;
 let lastTickError: string | null = null;
 
-function mapBeliefRow(row: BeliefHypothesisProposalRow): BeliefHypothesisProposal {
+async function runWithConcurrency<T>(items: T[], concurrency: number, worker: (item: T) => Promise<void>) {
+  if (items.length === 0) {
+    return;
+  }
+
+  let nextIndex = 0;
+  const workerCount = Math.min(concurrency, items.length);
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (nextIndex < items.length) {
+        const currentIndex = nextIndex;
+        nextIndex += 1;
+        await worker(items[currentIndex]);
+      }
+    }),
+  );
+}
+
+function mapBeliefRow(row: BeliefHypothesisProposalRow): CaseAwareBeliefHypothesisProposal {
   return {
     id: row.id,
     run_id: row.run_id,
@@ -126,6 +175,13 @@ function mapBeliefRow(row: BeliefHypothesisProposalRow): BeliefHypothesisProposa
     suggested_resolution_spec: row.suggested_resolution_spec
       ? parseJsonField(row.suggested_resolution_spec)
       : undefined,
+    event_case_id: row.event_case_id,
+    case_family_key: row.case_family_key,
+    belief_role: row.belief_role ?? undefined,
+    publishability_score:
+      row.publishability_score === null || row.publishability_score === undefined
+        ? undefined
+        : Number(row.publishability_score),
     dedupe_key: row.dedupe_key,
     created_at: toIsoTimestamp(row.created_at),
   };
@@ -146,7 +202,7 @@ function mapScenarioRow(row: ScenarioPathProposalRow): ScenarioPathProposal {
   };
 }
 
-function mapSynthesizedBeliefRow(row: SynthesizedBeliefRow): SynthesizedBelief {
+function mapSynthesizedBeliefRow(row: SynthesizedBeliefRow): CaseAwareSynthesizedBelief {
   return {
     id: row.id,
     run_id: row.run_id,
@@ -156,7 +212,7 @@ function mapSynthesizedBeliefRow(row: SynthesizedBeliefRow): SynthesizedBelief {
     disagreement_score: Number(row.disagreement_score),
     confidence_score: Number(row.confidence_score),
     conflict_notes: row.conflict_notes,
-    hypothesis: parseJsonField<BeliefHypothesisProposal>(row.hypothesis),
+    hypothesis: parseJsonField<CaseAwareBeliefHypothesisProposal>(row.hypothesis),
     status: row.status,
     suppression_reason: row.suppression_reason,
     linked_proposal_id: row.linked_proposal_id,
@@ -217,8 +273,8 @@ async function fetchScenarioPaths(runId: string) {
 }
 
 type CandidateAggregate = {
-  base: BeliefHypothesisProposal;
-  direct: BeliefHypothesisProposal[];
+  base: CaseAwareBeliefHypothesisProposal;
+  direct: CaseAwareBeliefHypothesisProposal[];
   scenarioEntries: Array<{ confidence: number; probability: number; label: string; reasoning: string }>;
 };
 
@@ -233,7 +289,31 @@ function average(values: number[]) {
   return values.reduce((sum, value) => sum + value, 0) / values.length;
 }
 
-function upsertCandidate(aggregateMap: Map<string, CandidateAggregate>, belief: BeliefHypothesisProposal) {
+function deriveAggregateScores(aggregate: CandidateAggregate) {
+  const directScores = aggregate.direct.map((entry) => entry.confidence_score);
+  const scenarioScores = aggregate.scenarioEntries.map((entry) => entry.confidence);
+  const weightedScenario =
+    aggregate.scenarioEntries.reduce((sum, entry) => sum + entry.confidence * entry.probability, 0) /
+    Math.max(
+      aggregate.scenarioEntries.reduce((sum, entry) => sum + entry.probability, 0),
+      1,
+    );
+  const directAverage = average(directScores);
+  const combinedConfidence = clamp(directAverage * 0.6 + weightedScenario * 0.4);
+  const allScores = [...directScores, ...scenarioScores].filter((value) => Number.isFinite(value));
+  const minScore = allScores.length > 0 ? Math.min(...allScores) : combinedConfidence;
+  const maxScore = allScores.length > 0 ? Math.max(...allScores) : combinedConfidence;
+  const disagreementScore = clamp(maxScore - minScore, 0, 1);
+  const agreementScore = clamp(1 - disagreementScore, 0, 1);
+
+  return {
+    confidenceScore: combinedConfidence,
+    agreementScore,
+    disagreementScore,
+  };
+}
+
+function upsertCandidate(aggregateMap: Map<string, CandidateAggregate>, belief: CaseAwareBeliefHypothesisProposal) {
   const existing = aggregateMap.get(belief.dedupe_key);
   if (existing) {
     existing.direct.push(belief);
@@ -251,7 +331,7 @@ function upsertCandidate(aggregateMap: Map<string, CandidateAggregate>, belief: 
 }
 
 function collectCandidates(
-  directHypotheses: BeliefHypothesisProposal[],
+  directHypotheses: CaseAwareBeliefHypothesisProposal[],
   scenarioPaths: ScenarioPathProposal[],
 ) {
   const aggregates = new Map<string, CandidateAggregate>();
@@ -278,82 +358,102 @@ function collectCandidates(
   return aggregates;
 }
 
-function synthesizeHeuristic(runId: string, aggregate: CandidateAggregate) {
-  const directScores = aggregate.direct.map((entry) => entry.confidence_score);
-  const scenarioScores = aggregate.scenarioEntries.map((entry) => entry.confidence);
-  const weightedScenario =
-    aggregate.scenarioEntries.reduce((sum, entry) => sum + entry.confidence * entry.probability, 0) /
-    Math.max(
-      aggregate.scenarioEntries.reduce((sum, entry) => sum + entry.probability, 0),
-      1,
-    );
-  const directAverage = average(directScores);
-  const combinedConfidence = clamp(directAverage * 0.6 + weightedScenario * 0.4);
-  const allScores = [...directScores, ...scenarioScores];
-  const minScore = Math.min(...allScores);
-  const maxScore = Math.max(...allScores);
-  const disagreementScore = clamp(maxScore - minScore, 0, 1);
-  const agreementScore = clamp(1 - disagreementScore, 0, 1);
-  const conflictNotes =
-    disagreementScore > 0.22
-      ? `Divergence observed across path labels: ${aggregate.scenarioEntries.map((entry) => entry.label).join(", ")}.`
-      : null;
-  const status: SynthesizedBelief["status"] =
-    aggregate.base.machine_resolvable && combinedConfidence >= minConfidenceForNew && disagreementScore <= maxDisagreementForNew
-      ? "new"
-      : disagreementScore > maxDisagreementForNew
-        ? "ambiguous"
-        : "suppressed";
-  const suppressionReason =
-    status === "suppressed"
-      ? "insufficient_combined_confidence"
-      : status === "ambiguous"
-        ? "agent_outputs_diverged"
-        : null;
+function caseGroupKeyForBelief(belief: CaseAwareSynthesizedBelief) {
+  return (
+    belief.hypothesis.event_case_id ??
+    belief.hypothesis.case_family_key ??
+    `${belief.hypothesis.category}:${belief.hypothesis.subject}:${belief.hypothesis.target_time.slice(0, 10)}`
+  );
+}
 
-  const hypothesis: BeliefHypothesisProposal = {
-    ...aggregate.base,
-    id: randomUUID(),
-    run_id: runId,
-    agent_id: agentId,
-    confidence_score: combinedConfidence,
-    reasoning_summary: `${agentId} synthesized ${aggregate.direct.length} direct hypotheses and ${aggregate.scenarioEntries.length} path hypotheses into one belief.`,
-    created_at: new Date().toISOString(),
-  };
+function compareCaseBeliefs(left: CaseAwareSynthesizedBelief, right: CaseAwareSynthesizedBelief) {
+  const leftStatusRank = left.status === "new" ? 3 : left.status === "ambiguous" ? 2 : left.status === "proposed" ? 1 : 0;
+  const rightStatusRank =
+    right.status === "new" ? 3 : right.status === "ambiguous" ? 2 : right.status === "proposed" ? 1 : 0;
 
-  const synthesized: SynthesizedBelief = {
-    id: randomUUID(),
-    run_id: runId,
-    agent_id: agentId,
-    parent_hypothesis_ids: aggregate.direct.map((entry) => entry.id),
-    agreement_score: agreementScore,
-    disagreement_score: disagreementScore,
-    confidence_score: combinedConfidence,
-    conflict_notes: conflictNotes,
-    hypothesis,
-    status,
-    suppression_reason: suppressionReason,
-    linked_proposal_id: null,
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
-  };
+  return (
+    rightStatusRank - leftStatusRank ||
+    Number(right.hypothesis.machine_resolvable) - Number(left.hypothesis.machine_resolvable) ||
+    (right.hypothesis.publishability_score ?? right.confidence_score) -
+      (left.hypothesis.publishability_score ?? left.confidence_score) ||
+    right.confidence_score - left.confidence_score ||
+    right.agreement_score - left.agreement_score ||
+    left.disagreement_score - right.disagreement_score ||
+    right.created_at.localeCompare(left.created_at)
+  );
+}
 
-  const validation = validateSynthesizedBelief(synthesized);
-  if (!validation.ok) {
-    throw new Error(`invalid_synthesized_belief:${validation.errors.join(",")}`);
+function promoteCasePrimaryBeliefs(beliefs: CaseAwareSynthesizedBelief[]) {
+  const groups = new Map<string, CaseAwareSynthesizedBelief[]>();
+  for (const belief of beliefs) {
+    const key = caseGroupKeyForBelief(belief);
+    groups.set(key, [...(groups.get(key) ?? []), belief]);
   }
 
-  return validation.belief;
+  const finalized: CaseAwareSynthesizedBelief[] = [];
+  for (const group of groups.values()) {
+    const ranked = [...group].sort(compareCaseBeliefs);
+    const primary = ranked[0];
+    for (const belief of ranked) {
+      if (belief.id === primary.id) {
+        finalized.push({
+          ...belief,
+          hypothesis: {
+            ...belief.hypothesis,
+            belief_role: "primary",
+          },
+        });
+        continue;
+      }
+
+      finalized.push({
+        ...belief,
+        status: "suppressed",
+        suppression_reason: "case_secondary",
+        hypothesis: {
+          ...belief.hypothesis,
+          belief_role: "secondary",
+        },
+        updated_at: new Date().toISOString(),
+      });
+    }
+  }
+
+  return finalized.sort((left, right) => right.created_at.localeCompare(left.created_at));
 }
 
 function buildSynthesisLlmSystemPrompt() {
   return [
     "You are a synthesis agent for a prediction-market simulation fabric.",
     "Return strict JSON only.",
-    "For each candidate key, output confidence, agreement, disagreement, status, and concise reasoning.",
+    "For each candidate key, output confidence_score, agreement_score, disagreement_score, status, and concise reasoning_summary.",
+    "Preserve distinction across event cases and avoid treating same-case variants as separate publishable winners.",
     "Use only provided keys.",
+    "Status must be one of: new, ambiguous, suppressed.",
     "All scores must be in [0,1].",
   ].join(" ");
+}
+
+function normalizeSynthesisStatus(
+  rawStatus: unknown,
+  aggregate: CandidateAggregate,
+  confidenceScore: number,
+  disagreementScore: number,
+): SynthesizedBelief["status"] {
+  if (rawStatus === "new" || rawStatus === "ambiguous" || rawStatus === "suppressed") {
+    return rawStatus;
+  }
+  if (rawStatus === "active" || rawStatus === "stable") {
+    return aggregate.base.machine_resolvable &&
+      confidenceScore >= minConfidenceForNew &&
+      disagreementScore <= maxDisagreementForNew
+      ? "new"
+      : "suppressed";
+  }
+  if (disagreementScore > maxDisagreementForNew) {
+    return "ambiguous";
+  }
+  return aggregate.base.machine_resolvable && confidenceScore >= minConfidenceForNew ? "new" : "suppressed";
 }
 
 function buildSynthesisLlmUserPayload(aggregates: Map<string, CandidateAggregate>) {
@@ -364,6 +464,10 @@ function buildSynthesisLlmUserPayload(aggregates: Map<string, CandidateAggregate
       hypothesis_kind: aggregate.base.hypothesis_kind,
       category: aggregate.base.category,
       subject: aggregate.base.subject,
+      event_case_id: aggregate.base.event_case_id ?? null,
+      case_family_key: aggregate.base.case_family_key ?? null,
+      belief_role: aggregate.base.belief_role ?? null,
+      publishability_score: aggregate.base.publishability_score ?? null,
       predicate: aggregate.base.predicate,
       target_time: aggregate.base.target_time,
       machine_resolvable: aggregate.base.machine_resolvable,
@@ -394,45 +498,96 @@ async function synthesizeWithLlm(runId: string, aggregates: Map<string, Candidat
     },
   ]);
 
-  if (!response || typeof response !== "object" || !Array.isArray(response.beliefs)) {
+  if (!response || typeof response !== "object") {
     throw new Error("invalid_synthesis_llm_response");
   }
 
-  const beliefs: SynthesizedBelief[] = [];
-  for (const item of response.beliefs) {
+  const beliefItems = Array.isArray(response.beliefs)
+    ? response.beliefs
+    : Array.isArray(response.results)
+      ? response.results.map((item) => ({
+          key: item.key,
+          agreement_score: item.agreement,
+          disagreement_score: item.disagreement,
+          confidence_score: item.confidence,
+          status: item.status,
+          conflict_notes: item.conflict_notes,
+          suppression_reason: item.suppression_reason,
+          reasoning_summary: item.reasoning,
+        }))
+      : Array.isArray(response.candidates)
+        ? response.candidates.map((item) => ({
+            key: item.key,
+            agreement_score: item.agreement_score ?? item.agreement,
+            disagreement_score: item.disagreement_score ?? item.disagreement,
+            confidence_score: item.confidence_score ?? item.confidence,
+            status: item.status,
+            conflict_notes: item.conflict_notes,
+            suppression_reason: item.suppression_reason,
+            reasoning_summary: item.reasoning_summary ?? item.reasoning,
+          }))
+      : null;
+  if (!beliefItems) {
+    throw new Error("invalid_synthesis_llm_response");
+  }
+
+  const beliefs: CaseAwareSynthesizedBelief[] = [];
+  for (const item of beliefItems) {
     const aggregate = aggregates.get(item.key);
     if (!aggregate) {
       continue;
     }
 
-    const hypothesis: BeliefHypothesisProposal = {
+    const defaults = deriveAggregateScores(aggregate);
+    const confidenceScore = Number.isFinite(Number(item.confidence_score))
+      ? clamp(Number(item.confidence_score), 0, 1)
+      : defaults.confidenceScore;
+    const agreementScore = Number.isFinite(Number(item.agreement_score))
+      ? clamp(Number(item.agreement_score), 0, 1)
+      : defaults.agreementScore;
+    const disagreementScore = Number.isFinite(Number(item.disagreement_score))
+      ? clamp(Number(item.disagreement_score), 0, 1)
+      : defaults.disagreementScore;
+    const reasoningSummary =
+      typeof item.reasoning_summary === "string" && item.reasoning_summary.trim().length > 0
+        ? item.reasoning_summary
+        : `${agentId} synthesized direct and scenario evidence for ${aggregate.base.subject}.`;
+    const status = normalizeSynthesisStatus(item.status, aggregate, confidenceScore, disagreementScore);
+    const suppressionReason =
+      status === "suppressed"
+        ? item.suppression_reason ?? "insufficient_combined_confidence"
+        : status === "ambiguous"
+          ? item.suppression_reason ?? "agent_outputs_diverged"
+          : null;
+
+    const hypothesis: CaseAwareBeliefHypothesisProposal = {
       ...aggregate.base,
       id: randomUUID(),
       run_id: runId,
       agent_id: agentId,
-      confidence_score: clamp(Number(item.confidence_score)),
-      reasoning_summary: item.reasoning_summary,
+      confidence_score: confidenceScore,
+      reasoning_summary: reasoningSummary,
       created_at: new Date().toISOString(),
     };
-    const synthesized: SynthesizedBelief = {
+    const synthesized: CaseAwareSynthesizedBelief = {
       id: randomUUID(),
       run_id: runId,
       agent_id: agentId,
       parent_hypothesis_ids: aggregate.direct.map((entry) => entry.id),
-      agreement_score: clamp(Number(item.agreement_score), 0, 1),
-      disagreement_score: clamp(Number(item.disagreement_score), 0, 1),
-      confidence_score: clamp(Number(item.confidence_score), 0, 1),
+      agreement_score: agreementScore,
+      disagreement_score: disagreementScore,
+      confidence_score: confidenceScore,
       conflict_notes: item.conflict_notes ?? null,
       hypothesis,
-      status: item.status,
-      suppression_reason: item.suppression_reason ?? null,
+      status,
+      suppression_reason: suppressionReason,
       linked_proposal_id: null,
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     };
     const validation = validateSynthesizedBelief(synthesized);
     if (validation.ok) {
-      beliefs.push(validation.belief);
+      beliefs.push(synthesized);
     }
   }
 
@@ -440,10 +595,10 @@ async function synthesizeWithLlm(runId: string, aggregates: Map<string, Candidat
     throw new Error("synthesis_llm_produced_no_valid_beliefs");
   }
 
-  return beliefs;
+  return promoteCasePrimaryBeliefs(beliefs);
 }
 
-async function upsertSynthesizedBelief(belief: SynthesizedBelief) {
+async function upsertSynthesizedBelief(belief: CaseAwareSynthesizedBelief) {
   await pool.query(
     `
       INSERT INTO synthesized_beliefs (
@@ -508,35 +663,32 @@ async function tick() {
   tickInFlight = true;
   try {
     const runs = await fetchRuns(batchSize);
-    for (const run of runs) {
+    const errors: string[] = [];
+    await runWithConcurrency(runs, runConcurrency, async (run) => {
       const directHypotheses = await fetchDirectHypotheses(run.id);
       const scenarioPaths = await fetchScenarioPaths(run.id);
       if (directHypotheses.length === 0 || scenarioPaths.length === 0) {
-        continue;
+        return;
       }
 
-      const aggregates = collectCandidates(directHypotheses, scenarioPaths);
-      let beliefs: SynthesizedBelief[] = [];
-      if (mode === "llm" && llmClient) {
-        try {
-          beliefs = await synthesizeWithLlm(run.id, aggregates);
-        } catch (error) {
-          if (llmStrict) {
-            throw error;
-          }
-          app.log.error({ err: error }, "synthesis-agent LLM generation failed; falling back to heuristic mode");
-          beliefs = [...aggregates.values()].map((aggregate) => synthesizeHeuristic(run.id, aggregate));
+      try {
+        if (mode !== "llm" || !llmClient) {
+          throw new Error("synthesis_agent_requires_llm_mode");
         }
-      } else {
-        beliefs = [...aggregates.values()].map((aggregate) => synthesizeHeuristic(run.id, aggregate));
-      }
 
-      for (const belief of beliefs) {
-        await upsertSynthesizedBelief(belief);
+        const aggregates = collectCandidates(directHypotheses, scenarioPaths);
+        const beliefs = await synthesizeWithLlm(run.id, aggregates);
+
+        for (const belief of beliefs) {
+          await upsertSynthesizedBelief(belief);
+        }
+      } catch (error) {
+        errors.push(`${run.id}:${String(error)}`);
+        app.log.error({ run_id: run.id, error: String(error) }, "synthesis_agent_failed_to_process_run");
       }
-    }
+    });
     lastTickAt = new Date().toISOString();
-    lastTickError = null;
+    lastTickError = errors.length > 0 ? errors.join(" | ").slice(0, 4_000) : null;
   } catch (error) {
     lastTickAt = new Date().toISOString();
     lastTickError = String(error);

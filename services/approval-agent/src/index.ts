@@ -67,6 +67,7 @@ const approvalAgentIds = [...new Set(configuredAgentIds)];
 const fallbackQuorum = Math.max(1, Math.min(approvalAgentIds.length, 2));
 const intervalMs = Number(process.env.APPROVAL_AGENT_INTERVAL_MS ?? 1000);
 const batchSize = Number(process.env.APPROVAL_AGENT_BATCH_SIZE ?? 20);
+const beliefConcurrency = Math.max(1, Number(process.env.APPROVAL_AGENT_BELIEF_CONCURRENCY ?? 8));
 const quorumRequired = Math.max(1, Number(process.env.APPROVAL_QUORUM_REQUIRED ?? fallbackQuorum));
 const minApprovals = Math.min(
   quorumRequired,
@@ -82,6 +83,24 @@ const pool = createDatabasePool();
 let tickInFlight = false;
 let lastTickAt: string | null = null;
 let lastTickError: string | null = null;
+
+async function runWithConcurrency<T>(items: T[], concurrency: number, worker: (item: T) => Promise<void>) {
+  if (items.length === 0) {
+    return;
+  }
+
+  let nextIndex = 0;
+  const workerCount = Math.min(concurrency, items.length);
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (nextIndex < items.length) {
+        const currentIndex = nextIndex;
+        nextIndex += 1;
+        await worker(items[currentIndex]);
+      }
+    }),
+  );
+}
 
 function mapSynthesizedBeliefRow(row: SynthesizedBeliefRow): SynthesizedBelief {
   return {
@@ -454,15 +473,17 @@ async function tick() {
   tickInFlight = true;
   try {
     const beliefs = await fetchCandidateBeliefs(batchSize);
-    for (const belief of beliefs) {
+    const errors: string[] = [];
+    await runWithConcurrency(beliefs, beliefConcurrency, async (belief) => {
       try {
         await processBelief(belief);
       } catch (error) {
+        errors.push(`${belief.id}:${String(error)}`);
         app.log.error({ error: String(error), belief_id: belief.id }, "approval_agent_failed_to_process_belief");
       }
-    }
+    });
     lastTickAt = new Date().toISOString();
-    lastTickError = null;
+    lastTickError = errors.length > 0 ? errors.join(" | ").slice(0, 4_000) : null;
   } catch (error) {
     lastTickAt = new Date().toISOString();
     lastTickError = String(error);

@@ -108,6 +108,8 @@ const resolutionRegistry: Record<ResolutionKind, ResolutionRegistryEntry> = {
       "kraken.com",
       "coingecko.com",
       "binance.com",
+      "frankfurter.app",
+      "stooq.com",
       "localhost",
       "127.0.0.1",
     ],

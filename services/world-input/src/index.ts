@@ -1,4 +1,6 @@
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { promisify } from "node:util";
 import Fastify from "fastify";
 import { createDatabasePool, ensureCoreSchema, parseJsonField, toIsoTimestamp } from "@automakit/persistence";
 import { ProxyAgent, setGlobalDispatcher } from "undici";
@@ -17,6 +19,7 @@ import {
 
 type WorldInputAdapterKind =
   | SourceAdapterKind
+  | "opencli_command"
   | "x_api_recent_search"
   | "reddit_api_subreddit_new"
   | "news_rss";
@@ -102,8 +105,10 @@ const backoffMaxMs = Number(process.env.WORLD_INPUT_BACKOFF_MAX_MS ?? 60_000);
 const claimBatchSize = Math.max(1, Number(process.env.WORLD_INPUT_CLAIM_BATCH_SIZE ?? 8));
 const claimLeaseMs = Math.max(1_000, Number(process.env.WORLD_INPUT_CLAIM_LEASE_MS ?? 30_000));
 const maxSourcesPerTick = Math.max(claimBatchSize, Number(process.env.WORLD_INPUT_MAX_SOURCES_PER_TICK ?? 64));
+const sourceConcurrency = Math.max(1, Number(process.env.WORLD_INPUT_SOURCE_CONCURRENCY ?? claimBatchSize));
 const app = Fastify({ logger: true });
 const pool = createDatabasePool();
+const execFileAsync = promisify(execFile);
 
 const outboundProxyUrl =
   process.env.HTTPS_PROXY ??
@@ -175,6 +180,24 @@ function readPath(root: unknown, path: string) {
   return current;
 }
 
+async function runWithConcurrency<T>(items: T[], concurrency: number, worker: (item: T) => Promise<void>) {
+  if (items.length === 0) {
+    return;
+  }
+
+  let nextIndex = 0;
+  const workerCount = Math.min(concurrency, items.length);
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (nextIndex < items.length) {
+        const currentIndex = nextIndex;
+        nextIndex += 1;
+        await worker(items[currentIndex]);
+      }
+    }),
+  );
+}
+
 function normalizeTimestamp(value: unknown): string | null {
   if (typeof value !== "string" || value.length === 0) {
     return null;
@@ -228,6 +251,8 @@ function mapSourceRow(row: WorldInputSourceRow): SourceWithConfig {
 
 function sourceKindFromAdapter(adapter: WorldInputAdapterKind): string {
   switch (adapter) {
+    case "opencli_command":
+      return "news";
     case "x_api_recent_search":
     case "reddit_api_subreddit_new":
       return "social";
@@ -258,6 +283,7 @@ function sanitizeSummary(value: string | null, fallback: string) {
 
 function stripHtml(value: string) {
   return value
+    .replace(/<!\[CDATA\[(.*?)\]\]>/gis, "$1")
     .replace(/<script[\s\S]*?<\/script>/gi, " ")
     .replace(/<style[\s\S]*?<\/style>/gi, " ")
     .replace(/<[^>]+>/g, " ")
@@ -288,6 +314,140 @@ function ensureObjectPayload(value: unknown) {
   return value && typeof value === "object" && !Array.isArray(value)
     ? { ...(value as Record<string, unknown>) }
     : {};
+}
+
+function resolveConfigPathValue(input: Record<string, unknown>, payload: Record<string, unknown>, path: string) {
+  return readPath(input, path) ?? readPath(payload, path);
+}
+
+function normalizePublishCategory(value: string | null) {
+  if (!value) {
+    return null;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  switch (normalized) {
+    case "met":
+    case "meteorological":
+      return "weather";
+    case "geo":
+    case "geological":
+      return "weather";
+    default:
+      return normalized;
+  }
+}
+
+function buildSignalPayloadEnrichments(
+  source: SourceWithConfig,
+  input: Record<string, unknown>,
+  payload: Record<string, unknown>,
+  sourceUrl: string | null,
+) {
+  const config = source.config_json;
+  const enrichments: Record<string, unknown> = {};
+  const rawPayloadCategory = asString(payload.category);
+  const configuredCategory = normalizePublishCategory(asString(config.category));
+  const payloadCategory = normalizePublishCategory(rawPayloadCategory);
+  const normalizedCategory =
+    configuredCategory && (!payloadCategory || payloadCategory === "weather" || payloadCategory === "met")
+      ? configuredCategory
+      : payloadCategory ?? configuredCategory;
+
+  const shouldDefaultAgentExtract =
+    asString(payload.resolution_extraction_mode) === null &&
+    asString(config.resolution_extraction_mode) === null &&
+    source.trust_tier !== "derived" &&
+    (
+      source.adapter === "http_json_official_announcement" ||
+      ((source.adapter === "news_rss" || source.adapter === "opencli_command") &&
+        normalizedCategory !== null &&
+        ["sports", "weather", "world", "business", "technology", "politics"].includes(normalizedCategory))
+    );
+  if (normalizedCategory && normalizedCategory !== rawPayloadCategory?.trim().toLowerCase()) {
+    enrichments.category = normalizedCategory;
+  }
+
+  const extractionMode = asString(config.resolution_extraction_mode) ?? (shouldDefaultAgentExtract ? "agent_extract" : null);
+  if (extractionMode && asString(payload.resolution_extraction_mode) === null) {
+    enrichments.resolution_extraction_mode = extractionMode;
+  }
+
+  const observationOccurrencePath =
+    asString(config.observation_occurrence_path) ??
+    ((source.adapter === "news_rss" || source.adapter === "http_json_official_announcement" || source.adapter === "opencli_command")
+      && extractionMode === "agent_extract"
+      ? "occurred"
+      : null);
+  if (observationOccurrencePath && asString(payload.observation_occurrence_path) === null) {
+    enrichments.observation_occurrence_path = observationOccurrencePath;
+  }
+
+  const observationPricePath = asString(config.observation_price_path);
+  if (observationPricePath && asString(payload.observation_price_path) === null) {
+    enrichments.observation_price_path = observationPricePath;
+  }
+
+  const directCanonicalSourceUrl = asString(config.canonical_source_url);
+  const canonicalSourceUrlPath = asString(config.canonical_source_url_path);
+  const canonicalSourceUrl =
+    (canonicalSourceUrlPath
+      ? asString(resolveConfigPathValue(input, payload, canonicalSourceUrlPath))
+      : null) ??
+    directCanonicalSourceUrl ??
+    ((source.adapter === "news_rss" || source.adapter === "opencli_command" || source.adapter === "http_json_official_announcement")
+      ? sourceUrl
+      : null);
+  if (canonicalSourceUrl && asString(payload.canonical_source_url) === null) {
+    enrichments.canonical_source_url = canonicalSourceUrl;
+  }
+
+  const eventName =
+    (asString(config.event_name_path)
+      ? asString(resolveConfigPathValue(input, payload, asString(config.event_name_path)!))
+      : null) ??
+    asString(config.event_name) ??
+    asString(input.title) ??
+    asString(payload.title) ??
+    asString(resolveConfigPathValue(input, payload, "properties.headline")) ??
+    asString(resolveConfigPathValue(input, payload, "properties.event"));
+  if (eventName && asString(payload.event_name) === null) {
+    enrichments.event_name = eventName;
+  }
+
+  if (normalizedCategory === "sports" && asString(payload.publishability_class) === null) {
+    enrichments.publishability_class = "sports_event";
+  } else if (normalizedCategory === "weather" && asString(payload.publishability_class) === null) {
+    enrichments.publishability_class = "weather_event";
+  } else if (
+    (source.adapter === "http_json_official_announcement" || source.kind === "official") &&
+    asString(payload.publishability_class) === null
+  ) {
+    enrichments.publishability_class = "official_news";
+  }
+
+  return enrichments;
+}
+
+function extractArrayItemsFromPayload(payload: unknown, itemsPath?: string | null) {
+  if (Array.isArray(payload)) {
+    return payload
+      .map((entry) => ensureObjectPayload(entry))
+      .filter((entry) => Object.keys(entry).length > 0);
+  }
+
+  const objectPayload = ensureObjectPayload(payload);
+  const configuredItems = itemsPath ? readPath(objectPayload, itemsPath) : undefined;
+  const implicitItems =
+    configuredItems === undefined && Array.isArray(objectPayload.items) ? objectPayload.items : configuredItems;
+
+  if (Array.isArray(implicitItems)) {
+    return implicitItems
+      .map((entry) => ensureObjectPayload(entry))
+      .filter((entry) => Object.keys(entry).length > 0);
+  }
+
+  return Object.keys(objectPayload).length > 0 ? [objectPayload] : [];
 }
 
 function extractXmlTag(source: string, tag: string) {
@@ -467,26 +627,65 @@ async function upsertSignal(signal: WorldSignal) {
 }
 
 function normalizeSignalFromItem(source: SourceWithConfig, item: Record<string, unknown>): WorldSignal {
+  const config = source.config_json;
   const input = ensureObjectPayload(item);
-  const payload = ensureObjectPayload(input.payload);
-  const mergedPayload = Object.keys(payload).length > 0 ? payload : input;
+  const basePayload = ensureObjectPayload(input.payload);
+  const payload =
+    (() => {
+      const payloadPath = asString(config.payload_path);
+      if (!payloadPath) {
+        return basePayload;
+      }
+      const resolved = resolveConfigPathValue(input, basePayload, payloadPath);
+      return ensureObjectPayload(resolved);
+    })() || basePayload;
+  const resolveConfiguredString = (pathKey: string, fallback: string | null = null) => {
+    const path = asString(config[pathKey]);
+    if (!path) {
+      return fallback;
+    }
+    return asString(resolveConfigPathValue(input, payload, path)) ?? fallback;
+  };
+  const configuredEffectiveAt =
+    (() => {
+      const path = asString(config.effective_at_path);
+      if (!path) {
+        return null;
+      }
+      return normalizeTimestamp(resolveConfigPathValue(input, payload, path));
+    })();
   const effectiveAt =
+    configuredEffectiveAt ??
     normalizeTimestamp(input.effective_at) ??
     normalizeTimestamp(input.target_time) ??
     normalizeTimestamp(input.observed_at) ??
-    normalizeTimestamp(mergedPayload.effective_at) ??
-    normalizeTimestamp(mergedPayload.target_time) ??
-    normalizeTimestamp(mergedPayload.observed_at);
+    normalizeTimestamp(payload.effective_at) ??
+    normalizeTimestamp(payload.target_time) ??
+    normalizeTimestamp(payload.observed_at) ??
+    normalizeTimestamp(resolveConfigPathValue(input, payload, "properties.sent")) ??
+    normalizeTimestamp(resolveConfigPathValue(input, payload, "properties.effective"));
   const sourceId =
+    resolveConfiguredString("source_id_path") ??
     asString(input.source_id) ??
     asString(input.id) ??
     buildDedupeKey({
       source_key: source.key,
       title: input.title ?? input.headline ?? input.name ?? "signal",
       effective_at: effectiveAt,
-      payload: mergedPayload,
+      payload: Object.keys(payload).length > 0 ? payload : input,
     });
-  const sourceUrl = asString(input.source_url) ?? asString(input.url) ?? source.source_url ?? "internal://world-input";
+  const sourceUrl =
+    resolveConfiguredString("source_url_path") ??
+    asString(input.source_url) ??
+    asString(input.url) ??
+    asString(resolveConfigPathValue(input, payload, "id")) ??
+    source.source_url ??
+    "internal://world-input";
+  const payloadBase = Object.keys(payload).length > 0 ? payload : input;
+  const mergedPayload = {
+    ...payloadBase,
+    ...buildSignalPayloadEnrichments(source, input, payloadBase, sourceUrl),
+  };
   const entityRefs =
     Array.isArray(input.entity_refs) && input.entity_refs.every((entry) => entry && typeof entry === "object")
       ? (input.entity_refs as WorldEntityRef[])
@@ -500,12 +699,20 @@ function normalizeSignalFromItem(source: SourceWithConfig, item: Record<string, 
         ];
 
   const title =
+    resolveConfiguredString("title_path") ??
     asString(input.title) ??
     asString(input.headline) ??
     asString(input.name) ??
+    asString(resolveConfigPathValue(input, payload, "properties.headline")) ??
+    asString(resolveConfigPathValue(input, payload, "properties.event")) ??
     `${source.key}:${sourceId.slice(0, 20)}`;
   const summary = sanitizeSummary(
-    asString(input.summary) ?? asString(input.description) ?? asString(input.text),
+    resolveConfiguredString("summary_path") ??
+      asString(input.summary) ??
+      asString(input.description) ??
+      asString(input.text) ??
+      asString(resolveConfigPathValue(input, payload, "properties.description")) ??
+      asString(resolveConfigPathValue(input, payload, "properties.areaDesc")),
     title,
   );
   const signal: WorldSignal = {
@@ -555,24 +762,75 @@ async function fetchHttpJsonSourceItems(source: SourceWithConfig): Promise<Sourc
   }
 
   const payload = (await response.json()) as unknown;
-  let items: Record<string, unknown>[];
-  if (Array.isArray(payload)) {
-    items = payload
-      .map((entry) => ensureObjectPayload(entry))
-      .filter((entry) => Object.keys(entry).length > 0);
-  } else if (payload && typeof payload === "object" && Array.isArray((payload as { items?: unknown[] }).items)) {
-    items = (payload as { items: unknown[] }).items
-      .map((entry) => ensureObjectPayload(entry))
-      .filter((entry) => Object.keys(entry).length > 0);
-  } else {
-    const entry = ensureObjectPayload(payload);
-    items = Object.keys(entry).length > 0 ? [entry] : [];
-  }
+  const items = extractArrayItemsFromPayload(payload, asString(source.config_json.items_path));
 
   return {
     items,
     next_cursor: source.cursor_value,
     metadata: { adapter: source.adapter },
+  };
+}
+
+async function fetchOpenCliCommandItems(source: SourceWithConfig): Promise<SourcePollResult> {
+  const config = source.config_json;
+  const command = asString(config.command);
+  if (!command) {
+    throw new Error(`world_input_source_opencli_command_missing:${source.key}`);
+  }
+
+  const args = Array.isArray(config.args)
+    ? config.args.map((value) => String(value))
+    : [];
+  const cwd = asString(config.cwd) ?? process.cwd();
+  const timeoutMs = Math.max(1_000, Number(asNumber(config.timeout_ms) ?? 30_000));
+  const maxBuffer = Math.max(1024 * 32, Number(asNumber(config.max_buffer_bytes) ?? 1024 * 1024));
+  const envOverrides =
+    config.env && typeof config.env === "object" && !Array.isArray(config.env)
+      ? Object.fromEntries(
+          Object.entries(config.env as Record<string, unknown>).map(([key, value]) => [key, String(value)]),
+        )
+      : {};
+
+  const { stdout, stderr } = await execFileAsync(command, args, {
+    cwd,
+    env: {
+      ...process.env,
+      ...envOverrides,
+    },
+    timeout: timeoutMs,
+    maxBuffer,
+  });
+
+  const trimmedStdout = stdout.trim();
+  if (trimmedStdout.length === 0) {
+    return {
+      items: [],
+      next_cursor: source.cursor_value,
+      metadata: { adapter: source.adapter, command, stderr: stderr.trim() || null },
+    };
+  }
+
+  let payload: unknown;
+  try {
+    payload = JSON.parse(trimmedStdout);
+  } catch {
+    throw new Error(`world_input_source_opencli_output_not_json:${source.key}`);
+  }
+
+  const itemsPath = asString(config.items_path);
+  const items = extractArrayItemsFromPayload(payload, itemsPath);
+  const payloadObject = ensureObjectPayload(payload);
+  const nextCursor = asString(payloadObject.next_cursor) ?? source.cursor_value;
+  return {
+    items,
+    next_cursor: nextCursor,
+    metadata: {
+      adapter: source.adapter,
+      command,
+      args,
+      stderr: stderr.trim() || null,
+      items_path: itemsPath,
+    },
   };
 }
 
@@ -865,6 +1123,8 @@ async function fetchSourceItems(source: SourceWithConfig): Promise<SourcePollRes
       return fetchRedditSubredditItems(source);
     case "news_rss":
       return fetchNewsRssItems(source);
+    case "opencli_command":
+      return fetchOpenCliCommandItems(source);
     case "http_json_calendar":
     case "http_json_price":
     case "http_csv_price":
@@ -885,7 +1145,9 @@ function expandHttpJsonPriceItems(source: SourceWithConfig, items: Record<string
 
   const config = source.config_json;
   const pricePath = asString(config.price_path) ?? "price";
-  const rawPrice = readPath(items[0], pricePath);
+  const item = ensureObjectPayload(items[0]);
+  const itemPayload = ensureObjectPayload(item.payload);
+  const rawPrice = readPath(item, pricePath) ?? readPath(itemPayload, pricePath);
   const currentPrice = asNumber(rawPrice);
   if (currentPrice === null || currentPrice <= 0) {
     throw new Error(`world_input_source_price_path_invalid:${source.key}:${pricePath}`);
@@ -903,9 +1165,11 @@ function expandHttpJsonPriceItems(source: SourceWithConfig, items: Record<string
 
   const observedAtPath = asString(config.observed_at_path);
   const observedAt =
-    (observedAtPath ? normalizeTimestamp(readPath(items[0], observedAtPath)) : null) ??
-    normalizeTimestamp((items[0] as Record<string, unknown>).observed_at) ??
-    normalizeTimestamp((items[0] as Record<string, unknown>).timestamp) ??
+    (observedAtPath ? normalizeTimestamp(readPath(item, observedAtPath) ?? readPath(itemPayload, observedAtPath)) : null) ??
+    normalizeTimestamp(item.observed_at) ??
+    normalizeTimestamp(item.timestamp) ??
+    normalizeTimestamp(itemPayload.observed_at) ??
+    normalizeTimestamp(itemPayload.timestamp) ??
     new Date().toISOString();
   const minuteBucket = Math.floor(new Date(observedAt).getTime() / 60_000);
   const scaledPrice = Math.round(roundedPrice * Math.pow(10, Math.min(6, roundDecimals)));
@@ -1208,14 +1472,14 @@ async function tick() {
       if (claimed.length === 0) {
         break;
       }
-      for (const source of claimed) {
+      await runWithConcurrency(claimed, Math.min(sourceConcurrency, claimLimit), async (source) => {
         try {
           await pollSource(source);
         } catch (error) {
           errors.push(`${source.key}:${String(error)}`);
           app.log.error({ source_key: source.key, error: String(error) }, "world_input_source_poll_failed");
         }
-      }
+      });
       processed += claimed.length;
     }
     lastTickAt = new Date().toISOString();

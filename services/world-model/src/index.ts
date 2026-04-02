@@ -18,11 +18,35 @@ import {
   validateWorldStateProposal,
 } from "@automakit/world-sim";
 
+type CaseAwareBeliefHypothesisProposal = BeliefHypothesisProposal & {
+  event_case_id?: string | null;
+  case_family_key?: string | null;
+  belief_role?: "primary" | "secondary";
+  publishability_score?: number;
+};
+
 type SimulationRunRow = {
   id: string;
   trigger_signal_ids: unknown;
+  trigger_event_case_ids: unknown;
   status: SimulationRunStatus;
   started_at: unknown;
+};
+
+type EventCaseContextRow = {
+  id: string;
+  kind: string;
+  title: string;
+  summary: string;
+  primary_entity: string;
+  source_types: unknown;
+  signal_count: number;
+  last_signal_at: unknown;
+};
+
+type EventCaseSignalLinkRow = {
+  event_case_id: string;
+  signal_id: string;
 };
 
 type WorldSignalRow = {
@@ -71,8 +95,32 @@ type BeliefHypothesisProposalRow = {
   source_signal_ids: unknown;
   machine_resolvable: boolean;
   suggested_resolution_spec: unknown;
+  event_case_id: string | null;
+  case_family_key: string | null;
+  belief_role: "primary" | "secondary" | null;
+  publishability_score: unknown;
   dedupe_key: string;
   created_at: unknown;
+};
+
+type EventCaseContext = {
+  id: string;
+  kind: string;
+  title: string;
+  summary: string;
+  primary_entity: string;
+  source_types: string[];
+  signal_count: number;
+  last_signal_at: string;
+  source_signal_ids: string[];
+};
+
+type CaseAnnotatedHypothesis = CaseAwareBeliefHypothesisProposal & {
+  source_signal: WorldSignal;
+  event_case_id: string | null;
+  case_family_key: string;
+  belief_role: "primary" | "secondary";
+  publishability_score: number;
 };
 
 type WorldModelLlmResponse = {
@@ -104,6 +152,9 @@ type WorldModelLlmResponse = {
 const port = Number(process.env.WORLD_MODEL_PORT ?? 4011);
 const intervalMs = Number(process.env.WORLD_MODEL_INTERVAL_MS ?? 1000);
 const batchSize = Number(process.env.WORLD_MODEL_BATCH_SIZE ?? 10);
+const runConcurrency = Math.max(1, Number(process.env.WORLD_MODEL_RUN_CONCURRENCY ?? 4));
+const maxHypothesesPerRun = Math.max(1, Number(process.env.WORLD_MODEL_MAX_HYPOTHESES_PER_RUN ?? 8));
+const maxPriceFamiliesPerRun = Math.max(1, Number(process.env.WORLD_MODEL_MAX_PRICE_FAMILIES_PER_RUN ?? 2));
 const agentId = process.env.WORLD_MODEL_AGENT_ID ?? "world-model-alpha";
 const agentProfile = process.env.WORLD_MODEL_AGENT_PROFILE ?? "macro";
 const mode = process.env.WORLD_MODEL_MODE ?? "llm";
@@ -119,6 +170,24 @@ const pool = createDatabasePool();
 let tickInFlight = false;
 let lastTickAt: string | null = null;
 let lastTickError: string | null = null;
+
+async function runWithConcurrency<T>(items: T[], concurrency: number, worker: (item: T) => Promise<void>) {
+  if (items.length === 0) {
+    return;
+  }
+
+  let nextIndex = 0;
+  const workerCount = Math.min(concurrency, items.length);
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (nextIndex < items.length) {
+        const currentIndex = nextIndex;
+        nextIndex += 1;
+        await worker(items[currentIndex]);
+      }
+    }),
+  );
+}
 
 function mapSignalRow(row: WorldSignalRow): WorldSignal {
   return {
@@ -155,7 +224,7 @@ function mapWorldStateProposalRow(row: WorldStateProposalRow): WorldStateProposa
   };
 }
 
-function mapHypothesisProposalRow(row: BeliefHypothesisProposalRow): BeliefHypothesisProposal {
+function mapHypothesisProposalRow(row: BeliefHypothesisProposalRow): CaseAwareBeliefHypothesisProposal {
   return {
     id: row.id,
     run_id: row.run_id,
@@ -173,6 +242,13 @@ function mapHypothesisProposalRow(row: BeliefHypothesisProposalRow): BeliefHypot
     suggested_resolution_spec: row.suggested_resolution_spec
       ? parseJsonField<ResolutionSpec>(row.suggested_resolution_spec)
       : undefined,
+    event_case_id: row.event_case_id,
+    case_family_key: row.case_family_key,
+    belief_role: row.belief_role ?? undefined,
+    publishability_score:
+      row.publishability_score === null || row.publishability_score === undefined
+        ? undefined
+        : Number(row.publishability_score),
     dedupe_key: row.dedupe_key,
     created_at: toIsoTimestamp(row.created_at),
   };
@@ -181,7 +257,7 @@ function mapHypothesisProposalRow(row: BeliefHypothesisProposalRow): BeliefHypot
 async function fetchRunsNeedingAgentOutput(limit: number) {
   const result = await pool.query<SimulationRunRow>(
     `
-      SELECT id, trigger_signal_ids, status, started_at
+      SELECT id, trigger_signal_ids, trigger_event_case_ids, status, started_at
       FROM simulation_runs
       WHERE status = 'world_model_pending'
         AND NOT EXISTS (
@@ -199,9 +275,59 @@ async function fetchRunsNeedingAgentOutput(limit: number) {
   return result.rows.map((row) => ({
     id: row.id,
     trigger_signal_ids: parseJsonField<string[]>(row.trigger_signal_ids),
+    trigger_event_case_ids: parseJsonField<string[]>(row.trigger_event_case_ids),
     status: row.status,
     started_at: toIsoTimestamp(row.started_at),
   }));
+}
+
+async function fetchEventCaseContexts(eventCaseIds: string[]) {
+  if (eventCaseIds.length === 0) {
+    return { eventCases: [] as EventCaseContext[], eventCaseIdsBySignal: new Map<string, string[]>() };
+  }
+
+  const [eventCaseResult, linksResult] = await Promise.all([
+    pool.query<EventCaseContextRow>(
+      `
+        SELECT id, kind, title, summary, primary_entity, source_types, signal_count, last_signal_at
+        FROM event_cases
+        WHERE id = ANY($1::text[])
+        ORDER BY last_signal_at ASC, id ASC
+      `,
+      [eventCaseIds],
+    ),
+    pool.query<EventCaseSignalLinkRow>(
+      `
+        SELECT event_case_id, signal_id
+        FROM event_case_signals
+        WHERE event_case_id = ANY($1::text[])
+        ORDER BY event_case_id ASC, signal_id ASC
+      `,
+      [eventCaseIds],
+    ),
+  ]);
+
+  const signalIdsByCase = new Map<string, string[]>();
+  const eventCaseIdsBySignal = new Map<string, string[]>();
+  for (const row of linksResult.rows) {
+    signalIdsByCase.set(row.event_case_id, [...(signalIdsByCase.get(row.event_case_id) ?? []), row.signal_id]);
+    eventCaseIdsBySignal.set(row.signal_id, [...(eventCaseIdsBySignal.get(row.signal_id) ?? []), row.event_case_id]);
+  }
+
+  return {
+    eventCases: eventCaseResult.rows.map((row) => ({
+      id: row.id,
+      kind: row.kind,
+      title: row.title,
+      summary: row.summary,
+      primary_entity: row.primary_entity,
+      source_types: parseJsonField<string[]>(row.source_types),
+      signal_count: Number(row.signal_count),
+      last_signal_at: toIsoTimestamp(row.last_signal_at),
+      source_signal_ids: signalIdsByCase.get(row.id) ?? [],
+    })),
+    eventCaseIdsBySignal,
+  };
 }
 
 async function fetchSignals(signalIds: string[]) {
@@ -228,6 +354,353 @@ function clamp(value: number, min = 0.05, max = 0.95) {
 
 function readResolutionExtractionMode(signal: WorldSignal): ResolutionExtractionMode | undefined {
   return signal.payload.resolution_extraction_mode === "agent_extract" ? "agent_extract" : undefined;
+}
+
+function publishabilityClassForSignal(signal: WorldSignal) {
+  return typeof signal.payload.publishability_class === "string" ? signal.payload.publishability_class.trim().toLowerCase() : null;
+}
+
+function targetTimeForSignal(signal: WorldSignal) {
+  const base = signal.effective_at ? new Date(signal.effective_at) : new Date();
+  const millis = Number.isFinite(base.getTime()) ? base.getTime() : Date.now();
+  const publishabilityClass = publishabilityClassForSignal(signal);
+  const category = categoryForSignal(signal);
+  const daysAhead =
+    publishabilityClass === "sports_event" || publishabilityClass === "weather_event"
+      ? 2
+      : publishabilityClass === "official_news" || category === "sports" || category === "weather"
+        ? 2
+        : 3;
+  return new Date(millis + daysAhead * 24 * 60 * 60 * 1000).toISOString();
+}
+
+function categoryForSignal(signal: WorldSignal) {
+  if (signal.source_type === "economic_calendar") {
+    return "economy";
+  }
+  if (signal.source_type === "price_feed") {
+    const subject = String(signal.payload.asset_symbol ?? signal.title).toUpperCase();
+    return subject.includes("BTC") || subject.includes("ETH") ? "crypto" : "markets";
+  }
+  if (typeof signal.payload.category === "string" && signal.payload.category.trim().length > 0) {
+    const normalized = signal.payload.category.trim().toLowerCase();
+    if (normalized === "met" || normalized === "meteorological" || normalized === "geo") {
+      return "weather";
+    }
+    return normalized;
+  }
+  if (signal.source_type === "filing") {
+    return "business";
+  }
+  if (signal.source_type === "official_announcement") {
+    return "world";
+  }
+  return "news";
+}
+
+function subjectForSignal(signal: WorldSignal) {
+  return String(
+    signal.payload.asset_symbol ??
+      signal.payload.institution ??
+      signal.payload.event_name ??
+      signal.payload.event ??
+      signal.title,
+  );
+}
+
+function predicateForSignal(signal: WorldSignal, kind: ResolutionSpec["kind"], threshold?: number, direction?: string) {
+  if (kind === "price_threshold") {
+    return `${subjectForSignal(signal)} spot price >= ${threshold ?? 0} by target date`;
+  }
+  if (kind === "rate_decision") {
+    const institution = String(signal.payload.institution ?? subjectForSignal(signal) ?? "Central bank");
+    return `${institution} will ${direction ?? "hold"} rates by target date`;
+  }
+  const subject = String(signal.payload.event_name ?? signal.payload.event ?? signal.title);
+  const publishabilityClass = publishabilityClassForSignal(signal);
+  if (publishabilityClass === "official_news") {
+    return `${subject} will be officially announced by target date`;
+  }
+  if (publishabilityClass === "weather_event") {
+    return `${subject} weather event will occur by target date`;
+  }
+  if (publishabilityClass === "sports_event") {
+    return `${subject} sports event will occur by target date`;
+  }
+  return `${signal.title} will occur by target date`;
+}
+
+function reasoningForSignal(signal: WorldSignal, kind: ResolutionSpec["kind"]) {
+  return `${agentId} formed a ${kind} hypothesis from signal ${signal.id}.`;
+}
+
+function fieldsForSignal(
+  signal: WorldSignal,
+  kind: ResolutionSpec["kind"],
+  threshold?: number,
+  direction?: "cut" | "hold" | "hike",
+) {
+  return {
+    subject: subjectForSignal(signal),
+    category: categoryForSignal(signal),
+    predicate: predicateForSignal(signal, kind, threshold, direction),
+  };
+}
+
+function normalizePriceOperator(value: unknown): "gt" | "gte" | "lt" | "lte" | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  switch (value.trim().toLowerCase()) {
+    case ">":
+    case "gt":
+      return "gt";
+    case ">=":
+    case "gte":
+      return "gte";
+    case "<":
+    case "lt":
+      return "lt";
+    case "<=":
+    case "lte":
+      return "lte";
+    default:
+      return null;
+  }
+}
+
+function derivePriceThresholdFromSignal(signal: WorldSignal) {
+  const rawPrice =
+    typeof signal.payload.price === "number"
+      ? signal.payload.price
+      : typeof signal.payload.close === "number"
+        ? signal.payload.close
+        : typeof signal.payload.current_price === "number"
+          ? signal.payload.current_price
+          : null;
+  if (!rawPrice || !Number.isFinite(rawPrice) || rawPrice <= 0) {
+    return null;
+  }
+
+  const category = categoryForSignal(signal);
+  const uplift =
+    category === "fx"
+      ? 0.01
+      : category === "crypto"
+        ? 0.03
+        : 0.02;
+  const decimals = category === "fx" ? 4 : 2;
+  const threshold = Number((rawPrice * (1 + uplift)).toFixed(decimals));
+
+  return {
+    operator: "gte" as const,
+    threshold,
+  };
+}
+
+function canonicalSourceUrlForSpec(spec?: ResolutionSpec) {
+  if (!spec || !spec.source || typeof spec.source.canonical_url !== "string") {
+    return null;
+  }
+  return spec.source.canonical_url;
+}
+
+function caseFamilyKeyForSignal(signal: WorldSignal, eventCaseId: string | null) {
+  if (eventCaseId) {
+    return eventCaseId;
+  }
+
+  return buildDedupeKey({
+    scope: "signal-fallback-case",
+    source_type: signal.source_type,
+    source_adapter: signal.source_adapter,
+    source_url: signal.source_url,
+    subject: subjectForSignal(signal),
+    category: categoryForSignal(signal),
+  });
+}
+
+function directionBucketForPrice(operator: PriceThresholdDecisionRule["operator"]) {
+  return operator === "gt" || operator === "gte" ? "up" : "down";
+}
+
+function targetDayBucket(targetTime: string) {
+  return targetTime.slice(0, 10);
+}
+
+function buildPriceFamilyKey(hypothesis: CaseAwareBeliefHypothesisProposal) {
+  if (hypothesis.hypothesis_kind !== "price_threshold" || !hypothesis.suggested_resolution_spec) {
+    return null;
+  }
+
+  const spec = hypothesis.suggested_resolution_spec;
+  if (spec.kind !== "price_threshold") {
+    return null;
+  }
+
+  const canonicalUrl = canonicalSourceUrlForSpec(spec);
+  if (!canonicalUrl) {
+    return null;
+  }
+
+  return buildDedupeKey({
+    scope: "price-family",
+    canonical_url: canonicalUrl,
+    direction: directionBucketForPrice(spec.decision_rule.operator),
+    target_day: targetDayBucket(hypothesis.target_time),
+  });
+}
+
+function compareAnnotatedHypotheses(
+  left: Pick<
+    CaseAnnotatedHypothesis,
+    "publishability_score" | "machine_resolvable" | "confidence_score" | "source_signal" | "hypothesis_kind" | "created_at"
+  >,
+  right: Pick<
+    CaseAnnotatedHypothesis,
+    "publishability_score" | "machine_resolvable" | "confidence_score" | "source_signal" | "hypothesis_kind" | "created_at"
+  >,
+) {
+  return (
+    right.publishability_score - left.publishability_score ||
+    Number(right.machine_resolvable) - Number(left.machine_resolvable) ||
+    right.confidence_score - left.confidence_score ||
+    Number(right.hypothesis_kind !== "price_threshold") - Number(left.hypothesis_kind !== "price_threshold") ||
+    Number(right.source_signal.trust_tier === "official") - Number(left.source_signal.trust_tier === "official") ||
+    right.created_at.localeCompare(left.created_at)
+  );
+}
+
+function scoreHypothesis(hypothesis: CaseAwareBeliefHypothesisProposal, signal: WorldSignal, eventCaseId: string | null) {
+  const category = hypothesis.category;
+  let score = clamp(hypothesis.confidence_score, 0, 1);
+
+  if (hypothesis.machine_resolvable) {
+    score += 0.25;
+  }
+  if (hypothesis.hypothesis_kind !== "price_threshold") {
+    score += 0.08;
+  }
+  if (signal.trust_tier === "official") {
+    score += 0.05;
+  } else if (signal.trust_tier === "curated") {
+    score += 0.02;
+  }
+  if (category === "world" || category === "sports" || category === "weather" || category === "business") {
+    score += 0.04;
+  }
+  if (publishabilityClassForSignal(signal) === "official_news") {
+    score += 0.08;
+  } else if (publishabilityClassForSignal(signal) === "weather_event") {
+    score += 0.06;
+  } else if (publishabilityClassForSignal(signal) === "sports_event") {
+    score += 0.05;
+  }
+  if (eventCaseId) {
+    score += 0.04;
+  }
+
+  return clamp(score, 0, 1.5);
+}
+
+function selectHypothesesForPersistence(
+  hypotheses: CaseAwareBeliefHypothesisProposal[],
+  signalMap: Map<string, WorldSignal>,
+  eventCaseIdsBySignal: Map<string, string[]>,
+) {
+  const eligibleBase = hypotheses.filter((hypothesis) => signalMap.has(hypothesis.source_signal_ids[0] ?? ""));
+  const pool = eligibleBase.some((hypothesis) => hypothesis.machine_resolvable)
+    ? eligibleBase.filter((hypothesis) => hypothesis.machine_resolvable)
+    : eligibleBase;
+
+  const annotated = pool.map((hypothesis) => {
+    const sourceSignal = signalMap.get(hypothesis.source_signal_ids[0] ?? "") as WorldSignal;
+    const eventCaseId = eventCaseIdsBySignal.get(sourceSignal.id)?.[0] ?? null;
+    const caseFamilyKey = caseFamilyKeyForSignal(sourceSignal, eventCaseId);
+    return {
+      ...hypothesis,
+      source_signal: sourceSignal,
+      event_case_id: eventCaseId,
+      case_family_key: caseFamilyKey,
+      belief_role: "primary" as const,
+      publishability_score: scoreHypothesis(hypothesis, sourceSignal, eventCaseId),
+    } satisfies CaseAnnotatedHypothesis;
+  });
+
+  const bestByCase = new Map<string, CaseAnnotatedHypothesis>();
+  for (const candidate of annotated) {
+    const existing = bestByCase.get(candidate.case_family_key);
+    if (!existing || compareAnnotatedHypotheses(candidate, existing) < 0) {
+      bestByCase.set(candidate.case_family_key, candidate);
+    }
+  }
+
+  const cappedByPriceFamily = new Map<string, CaseAnnotatedHypothesis>();
+  const nonPriceCandidates: CaseAnnotatedHypothesis[] = [];
+  for (const candidate of bestByCase.values()) {
+    const priceFamilyKey = buildPriceFamilyKey(candidate);
+    if (!priceFamilyKey) {
+      nonPriceCandidates.push(candidate);
+      continue;
+    }
+    const existing = cappedByPriceFamily.get(priceFamilyKey);
+    if (!existing || compareAnnotatedHypotheses(candidate, existing) < 0) {
+      cappedByPriceFamily.set(priceFamilyKey, candidate);
+    }
+  }
+
+  const candidates = [...nonPriceCandidates, ...cappedByPriceFamily.values()].sort(compareAnnotatedHypotheses);
+  const selected = new Map<string, CaseAnnotatedHypothesis>();
+  const representedCategories = new Set<string>();
+  const hasNonPriceCandidates = candidates.some((candidate) => candidate.hypothesis_kind !== "price_threshold");
+  const maxPriceSelections = hasNonPriceCandidates ? maxPriceFamiliesPerRun : Math.min(maxHypothesesPerRun, 4);
+  let priceSelections = 0;
+
+  const categoriesByPriority = [...new Set(candidates.map((candidate) => candidate.category))];
+  for (const category of categoriesByPriority) {
+    if (selected.size >= maxHypothesesPerRun) {
+      break;
+    }
+    const winner = candidates.find((candidate) => candidate.category === category && !selected.has(candidate.id));
+    if (!winner) {
+      continue;
+    }
+    if (winner.hypothesis_kind === "price_threshold" && priceSelections >= maxPriceSelections) {
+      continue;
+    }
+    selected.set(winner.id, winner);
+    representedCategories.add(category);
+    if (winner.hypothesis_kind === "price_threshold") {
+      priceSelections += 1;
+    }
+  }
+
+  for (const candidate of candidates) {
+    if (selected.size >= maxHypothesesPerRun) {
+      break;
+    }
+    if (selected.has(candidate.id)) {
+      continue;
+    }
+    if (candidate.hypothesis_kind === "price_threshold" && priceSelections >= maxPriceSelections) {
+      continue;
+    }
+    if (!representedCategories.has(candidate.category) && selected.size > 0) {
+      representedCategories.add(candidate.category);
+    }
+    selected.set(candidate.id, candidate);
+    if (candidate.hypothesis_kind === "price_threshold") {
+      priceSelections += 1;
+    }
+  }
+
+  const finalized = [...selected.values()].sort(compareAnnotatedHypotheses).map((candidate) => {
+    const { source_signal: _sourceSignal, ...hypothesis } = candidate;
+    return hypothesis;
+  });
+
+  return finalized.length > 0 ? finalized : hypotheses.sort((left, right) => right.confidence_score - left.confidence_score).slice(0, 1);
 }
 
 function buildPriceThresholdSpec(
@@ -335,24 +808,92 @@ function buildRateDecisionSpec(signal: WorldSignal): ResolutionSpec | null {
   };
 }
 
+function buildEventOccurrenceSpec(signal: WorldSignal): ResolutionSpec | null {
+  const canonicalSourceUrl =
+    typeof signal.payload.canonical_source_url === "string" ? signal.payload.canonical_source_url : signal.source_url;
+  const observationPath =
+    typeof signal.payload.observation_occurrence_path === "string" &&
+    signal.payload.observation_occurrence_path.trim().length > 0
+      ? signal.payload.observation_occurrence_path.trim()
+      : null;
+
+  if (!canonicalSourceUrl || !observationPath) {
+    return null;
+  }
+
+  return {
+    kind: "event_occurrence",
+    source: {
+      adapter: "http_json",
+      canonical_url: canonicalSourceUrl,
+      allowed_domains: normalizeAllowedDomainsFromUrl(canonicalSourceUrl),
+      extraction_mode: readResolutionExtractionMode(signal),
+    },
+    observation_schema: {
+      type: "object",
+      fields: {
+        occurred: { type: "boolean", path: observationPath },
+        observed_at: { type: "string", path: "observed_at", required: false },
+      },
+    },
+    decision_rule: {
+      kind: "event_occurrence",
+      observation_field: "occurred",
+      expected_value: true,
+    },
+    quorum_rule: {
+      min_observations: 2,
+      min_distinct_collectors: 2,
+      agreement: "all",
+    },
+    quarantine_rule: {
+      on_source_fetch_failure: true,
+      on_schema_validation_failure: true,
+      on_observation_conflict: true,
+      max_observation_age_seconds: 3600,
+    },
+  };
+}
+
 function buildWorldModelLlmSystemPrompt() {
   return [
     "You are a world-model agent in an autonomous prediction-market platform.",
     "Return strict JSON only.",
     "Generate one world_state object and a hypotheses array.",
     "Each hypothesis must map to one input signal via source_signal_id.",
+    "Treat event cases as the primary unit of thought, not isolated raw signals.",
     "Use only these hypothesis kinds: price_threshold, rate_decision, event_occurrence.",
     "Set confidence_score in [0,1].",
-    "For price_threshold hypotheses, always include price_threshold.operator and price_threshold.threshold.",
+    "Every hypothesis must include source_signal_id, hypothesis_kind, subject, predicate, target_time, reasoning_summary, and confidence_score.",
+    "For price_threshold hypotheses, always include price_threshold.operator using gt/gte/lt/lte and price_threshold.threshold.",
+    "Prefer one distinct publishable belief per event case when possible.",
+    "Prefer coverage across distinct source signals and source types when valid machine-resolvable signals are present.",
+    "Do not emit multiple near-identical BTC hypotheses if other eligible signals are available in the same batch.",
     "Never hallucinate source ids.",
   ].join(" ");
 }
 
-function buildWorldModelLlmUserPayload(signals: WorldSignal[]) {
+function buildWorldModelLlmUserPayload(
+  signals: WorldSignal[],
+  eventCases: EventCaseContext[],
+  eventCaseIdsBySignal: Map<string, string[]>,
+) {
   return {
     agent_profile: agentProfile,
+    event_cases: eventCases.map((eventCase) => ({
+      id: eventCase.id,
+      kind: eventCase.kind,
+      title: eventCase.title,
+      summary: eventCase.summary,
+      primary_entity: eventCase.primary_entity,
+      source_types: eventCase.source_types,
+      signal_count: eventCase.signal_count,
+      last_signal_at: eventCase.last_signal_at,
+      source_signal_ids: eventCase.source_signal_ids,
+    })),
     signals: signals.map((signal) => ({
       id: signal.id,
+      event_case_ids: eventCaseIdsBySignal.get(signal.id) ?? [],
       source_type: signal.source_type,
       title: signal.title,
       summary: signal.summary,
@@ -363,7 +904,13 @@ function buildWorldModelLlmUserPayload(signals: WorldSignal[]) {
   };
 }
 
-async function generateWithLlm(runId: string, triggerSignalIds: string[], signals: WorldSignal[]) {
+async function generateWithLlm(
+  runId: string,
+  triggerSignalIds: string[],
+  signals: WorldSignal[],
+  eventCases: EventCaseContext[],
+  eventCaseIdsBySignal: Map<string, string[]>,
+) {
   if (!llmClient) {
     throw new Error("world_model_llm_client_unavailable");
   }
@@ -372,7 +919,7 @@ async function generateWithLlm(runId: string, triggerSignalIds: string[], signal
     { role: "system", content: buildWorldModelLlmSystemPrompt() },
     {
       role: "user",
-      content: JSON.stringify(buildWorldModelLlmUserPayload(signals)),
+      content: JSON.stringify(buildWorldModelLlmUserPayload(signals, eventCases, eventCaseIdsBySignal)),
     },
   ]);
 
@@ -406,54 +953,107 @@ async function generateWithLlm(runId: string, triggerSignalIds: string[], signal
     throw new Error(`invalid_world_state_proposal:${stateValidation.errors.join(",")}`);
   }
 
-  const hypotheses: BeliefHypothesisProposal[] = [];
+  const hypotheses: CaseAwareBeliefHypothesisProposal[] = [];
   for (const item of response.hypotheses) {
     const signal = signalMap.get(item.source_signal_id);
     if (!signal) {
       continue;
     }
 
-    let suggestedResolutionSpec: ResolutionSpec | undefined;
-    if (item.hypothesis_kind === "price_threshold") {
-      if (!item.price_threshold) {
-        continue;
-      }
-      suggestedResolutionSpec = buildPriceThresholdSpec(signal, {
-        operator: item.price_threshold.operator,
-        threshold: item.price_threshold.threshold,
-      }) ?? undefined;
-    } else if (item.hypothesis_kind === "rate_decision") {
-      suggestedResolutionSpec = buildRateDecisionSpec(signal) ?? undefined;
+    const normalizedKind =
+      signal.source_type === "price_feed"
+        ? "price_threshold"
+        : signal.source_type === "economic_calendar"
+          ? "rate_decision"
+          : "event_occurrence";
+    if (!normalizedKind) {
+      continue;
     }
 
+    let suggestedResolutionSpec: ResolutionSpec | undefined;
+    let resolvedThreshold: number | undefined;
+    let resolvedDirection: "cut" | "hold" | "hike" | undefined;
+    if (normalizedKind === "price_threshold") {
+      const derivedThreshold = derivePriceThresholdFromSignal(signal);
+      const operator = normalizePriceOperator(item.price_threshold?.operator) ?? derivedThreshold?.operator ?? null;
+      const threshold = Number(item.price_threshold?.threshold ?? derivedThreshold?.threshold);
+      if (!operator || !Number.isFinite(threshold) || threshold <= 0) {
+        continue;
+      }
+      resolvedThreshold = threshold;
+      suggestedResolutionSpec = buildPriceThresholdSpec(signal, {
+        operator,
+        threshold,
+      }) ?? undefined;
+    } else if (normalizedKind === "rate_decision") {
+      const directionValue = String(signal.payload.direction ?? signal.payload.expected_direction ?? "hold").toLowerCase();
+      resolvedDirection =
+        directionValue === "cut" || directionValue === "hold" || directionValue === "hike" ? directionValue : "hold";
+      suggestedResolutionSpec = buildRateDecisionSpec(signal) ?? undefined;
+    } else if (normalizedKind === "event_occurrence") {
+      suggestedResolutionSpec = buildEventOccurrenceSpec(signal) ?? undefined;
+    }
+
+    const signalFields = fieldsForSignal(signal, normalizedKind, resolvedThreshold, resolvedDirection);
     const machineResolvable = Boolean(item.machine_resolvable ?? true) && Boolean(suggestedResolutionSpec);
-    const hypothesis: BeliefHypothesisProposal = {
-      id: randomUUID(),
+    const subject = signalFields.subject;
+    const eventCaseId = eventCaseIdsBySignal.get(signal.id)?.[0] ?? null;
+    const caseFamilyKey = caseFamilyKeyForSignal(signal, eventCaseId);
+    const targetTime =
+      typeof item.target_time === "string" && item.target_time.trim().length > 0
+        ? item.target_time
+        : targetTimeForSignal(signal);
+    const category = signalFields.category;
+    const predicate = signalFields.predicate;
+    const confidenceScore = clamp(Number(item.confidence_score));
+    const reasoningSummary =
+      typeof item.reasoning_summary === "string" && item.reasoning_summary.trim().length > 0
+        ? item.reasoning_summary.trim()
+        : reasoningForSignal(signal, normalizedKind);
+    const hypothesisBase: Omit<CaseAwareBeliefHypothesisProposal, "id" | "dedupe_key" | "created_at"> = {
       run_id: runId,
       agent_id: agentId,
       parent_ids: [signal.id],
-      hypothesis_kind: item.hypothesis_kind,
-      category: item.category,
-      subject: item.subject,
-      predicate: item.predicate,
-      target_time: item.target_time,
-      confidence_score: clamp(Number(item.confidence_score)),
-      reasoning_summary: item.reasoning_summary,
+      hypothesis_kind: normalizedKind,
+      category,
+      subject,
+      predicate,
+      target_time: targetTime,
+      confidence_score: confidenceScore,
+      reasoning_summary: reasoningSummary,
       source_signal_ids: [signal.id],
       machine_resolvable: machineResolvable,
       suggested_resolution_spec: suggestedResolutionSpec,
+      event_case_id: eventCaseId,
+      case_family_key: caseFamilyKey,
+      belief_role: "secondary",
+      publishability_score: undefined,
+    };
+    const hypothesis: CaseAwareBeliefHypothesisProposal = {
+      id: randomUUID(),
+      ...hypothesisBase,
+      publishability_score: scoreHypothesis(
+        {
+          ...hypothesisBase,
+          id: "score-only",
+          dedupe_key: "score-only",
+          created_at: new Date().toISOString(),
+        },
+        signal,
+        eventCaseId,
+      ),
       dedupe_key: buildDedupeKey({
-        kind: item.hypothesis_kind,
-        subject: item.subject,
-        predicate: item.predicate,
-        target_time: item.target_time,
+        kind: normalizedKind,
+        subject,
+        predicate,
+        target_time: targetTime,
         resolution_spec: suggestedResolutionSpec ?? null,
       }),
       created_at: new Date().toISOString(),
     };
     const validation = validateBeliefHypothesisProposal(hypothesis);
     if (validation.ok) {
-      hypotheses.push(validation.proposal);
+      hypotheses.push(hypothesis);
     }
   }
 
@@ -461,9 +1061,14 @@ async function generateWithLlm(runId: string, triggerSignalIds: string[], signal
     throw new Error("world_model_llm_produced_no_valid_hypotheses");
   }
 
+  const selectedHypotheses = selectHypothesesForPersistence(hypotheses, signalMap, eventCaseIdsBySignal);
+  if (selectedHypotheses.length === 0) {
+    throw new Error("world_model_selection_produced_no_hypotheses");
+  }
+
   return {
     worldStateProposal: stateValidation.proposal,
-    hypotheses,
+    hypotheses: selectedHypotheses,
   };
 }
 
@@ -511,7 +1116,7 @@ async function upsertWorldStateProposal(proposal: WorldStateProposal) {
   );
 }
 
-async function upsertBeliefHypothesisProposal(proposal: BeliefHypothesisProposal) {
+async function upsertBeliefHypothesisProposal(proposal: CaseAwareBeliefHypothesisProposal) {
   await pool.query(
     `
       INSERT INTO belief_hypothesis_proposals (
@@ -529,18 +1134,26 @@ async function upsertBeliefHypothesisProposal(proposal: BeliefHypothesisProposal
         source_signal_ids,
         machine_resolvable,
         suggested_resolution_spec,
+        event_case_id,
+        case_family_key,
+        belief_role,
+        publishability_score,
         dedupe_key,
         created_at
       )
       VALUES (
-        $1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9::timestamptz, $10, $11, $12::jsonb, $13, $14::jsonb, $15, $16::timestamptz
+        $1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9::timestamptz, $10, $11, $12::jsonb, $13, $14::jsonb, $15, $16, $17, $18, $19, $20::timestamptz
       )
       ON CONFLICT (run_id, agent_id, dedupe_key) DO UPDATE SET
         confidence_score = EXCLUDED.confidence_score,
         reasoning_summary = EXCLUDED.reasoning_summary,
         source_signal_ids = EXCLUDED.source_signal_ids,
         machine_resolvable = EXCLUDED.machine_resolvable,
-        suggested_resolution_spec = EXCLUDED.suggested_resolution_spec
+        suggested_resolution_spec = EXCLUDED.suggested_resolution_spec,
+        event_case_id = EXCLUDED.event_case_id,
+        case_family_key = EXCLUDED.case_family_key,
+        belief_role = EXCLUDED.belief_role,
+        publishability_score = EXCLUDED.publishability_score
     `,
     [
       proposal.id,
@@ -557,13 +1170,17 @@ async function upsertBeliefHypothesisProposal(proposal: BeliefHypothesisProposal
       JSON.stringify(proposal.source_signal_ids),
       proposal.machine_resolvable,
       JSON.stringify(proposal.suggested_resolution_spec ?? null),
+      proposal.event_case_id ?? null,
+      proposal.case_family_key ?? null,
+      proposal.belief_role ?? null,
+      proposal.publishability_score ?? null,
       proposal.dedupe_key,
       proposal.created_at,
     ],
   );
 }
 
-async function processRun(runId: string, triggerSignalIds: string[]) {
+async function processRun(runId: string, triggerSignalIds: string[], triggerEventCaseIds: string[]) {
   const signals = await fetchSignals(triggerSignalIds);
   if (signals.length === 0) {
     return;
@@ -572,14 +1189,15 @@ async function processRun(runId: string, triggerSignalIds: string[]) {
   let output:
     | {
         worldStateProposal: WorldStateProposal;
-        hypotheses: BeliefHypothesisProposal[];
+        hypotheses: CaseAwareBeliefHypothesisProposal[];
       }
     | undefined;
 
   if (mode !== "llm" || !llmClient) {
     throw new Error("world_model_requires_llm_mode_and_client");
   }
-  output = await generateWithLlm(runId, triggerSignalIds, signals);
+  const { eventCases, eventCaseIdsBySignal } = await fetchEventCaseContexts(triggerEventCaseIds);
+  output = await generateWithLlm(runId, triggerSignalIds, signals, eventCases, eventCaseIdsBySignal);
 
   await upsertWorldStateProposal(output.worldStateProposal);
   for (const hypothesis of output.hypotheses) {
@@ -595,11 +1213,17 @@ async function tick() {
   tickInFlight = true;
   try {
     const runs = await fetchRunsNeedingAgentOutput(batchSize);
-    for (const run of runs) {
-      await processRun(run.id, run.trigger_signal_ids);
-    }
+    const errors: string[] = [];
+    await runWithConcurrency(runs, runConcurrency, async (run) => {
+      try {
+        await processRun(run.id, run.trigger_signal_ids, run.trigger_event_case_ids);
+      } catch (error) {
+        errors.push(`${run.id}:${String(error)}`);
+        app.log.error({ run_id: run.id, error: String(error) }, "world_model_failed_to_process_run");
+      }
+    });
     lastTickAt = new Date().toISOString();
-    lastTickError = null;
+    lastTickError = errors.length > 0 ? errors.join(" | ").slice(0, 4_000) : null;
   } catch (error) {
     lastTickAt = new Date().toISOString();
     lastTickError = String(error);

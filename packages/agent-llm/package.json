@@ -13,5 +13,8 @@
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     }
+  },
+  "dependencies": {
+    "undici": "^7.16.0"
   }
 }

@@ -64,42 +64,50 @@ type ScenarioPathProposalRow = {
 };
 
 type ScenarioLlmResponse = {
-  narrative: string;
-  factor_deltas: Record<string, unknown>;
-  path_events: Array<{
+  narrative?: string;
+  description?: string;
+  summary?: string;
+  factor_deltas?: Record<string, unknown>;
+  confidence_updates?: Record<string, number>;
+  path_events?: Array<{
     title: string;
     event_type: string;
     description: string;
     effective_at?: string | null;
   }>;
-  path_hypotheses: Array<{
+  path_hypotheses?: Array<{
     key: string;
     confidence_score: number;
-    reasoning_summary: string;
+    confidence?: number;
+    reasoning_summary?: string;
+    reasoning?: string;
   }>;
+  hypotheses?: Array<{
+    key: string;
+    confidence_score?: number;
+    confidence?: number;
+    reasoning_summary?: string;
+    reasoning?: string;
+  }>;
+  scenario?: {
+    narrative?: string;
+    confidence_updates?: Record<string, number>;
+  };
 };
 
 const port = Number(process.env.SCENARIO_AGENT_PORT ?? 4018);
 const intervalMs = Number(process.env.SCENARIO_AGENT_INTERVAL_MS ?? 1000);
 const batchSize = Number(process.env.SCENARIO_AGENT_BATCH_SIZE ?? 10);
+const runConcurrency = Math.max(1, Number(process.env.SCENARIO_AGENT_RUN_CONCURRENCY ?? 4));
 const agentId = process.env.SCENARIO_AGENT_ID ?? "scenario-base";
 const label = process.env.SCENARIO_LABEL ?? "base";
 const configuredProbability = Number(process.env.SCENARIO_PROBABILITY ?? "0.5");
 const mode = process.env.SCENARIO_AGENT_MODE ?? "llm";
-const llmStrict = (process.env.SCENARIO_AGENT_LLM_STRICT ?? "false").toLowerCase() !== "false";
 const llmClient = (() => {
   if (mode !== "llm") {
     return null;
   }
-  try {
-    return loadLlmClientFromEnv();
-  } catch (error) {
-    if (llmStrict) {
-      throw error;
-    }
-    console.warn("[scenario-agent] llm init failed; using heuristic mode fallback", error);
-    return null;
-  }
+  return loadLlmClientFromEnv();
 })();
 const app = Fastify({ logger: true });
 const pool = createDatabasePool();
@@ -107,6 +115,24 @@ const pool = createDatabasePool();
 let tickInFlight = false;
 let lastTickAt: string | null = null;
 let lastTickError: string | null = null;
+
+async function runWithConcurrency<T>(items: T[], concurrency: number, worker: (item: T) => Promise<void>) {
+  if (items.length === 0) {
+    return;
+  }
+
+  let nextIndex = 0;
+  const workerCount = Math.min(concurrency, items.length);
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (nextIndex < items.length) {
+        const currentIndex = nextIndex;
+        nextIndex += 1;
+        await worker(items[currentIndex]);
+      }
+    }),
+  );
+}
 
 function mapWorldStateProposalRow(row: WorldStateProposalRow): WorldStateProposal {
   return {
@@ -407,52 +433,134 @@ async function buildScenarioProposalLlm(
     },
   ]);
 
-  if (!response || typeof response !== "object" || !Array.isArray(response.path_hypotheses)) {
+  if (!response || typeof response !== "object") {
     throw new Error("invalid_scenario_llm_response");
   }
 
   const aggregateMap = new Map(aggregates.map((aggregate) => [aggregate.key, aggregate]));
   const pathHypotheses: ScenarioPathHypothesis[] = [];
-  for (const item of response.path_hypotheses) {
-    const aggregate = aggregateMap.get(item.key);
-    if (!aggregate) {
-      continue;
+
+  if (Array.isArray(response.path_hypotheses)) {
+    for (const item of response.path_hypotheses) {
+      const aggregate = aggregateMap.get(item.key);
+      if (!aggregate) {
+        continue;
+      }
+      pathHypotheses.push({
+        key: aggregate.key,
+        hypothesis_kind: aggregate.base.hypothesis_kind,
+        category: aggregate.base.category,
+        subject: aggregate.base.subject,
+        predicate: aggregate.base.predicate,
+        target_time: aggregate.base.target_time,
+        confidence_score: clamp(Number(item.confidence_score ?? item.confidence)),
+        reasoning_summary:
+          typeof (item.reasoning_summary ?? item.reasoning) === "string" &&
+          String(item.reasoning_summary ?? item.reasoning).trim().length > 0
+            ? String(item.reasoning_summary ?? item.reasoning)
+            : `${agentId} updated confidence for ${aggregate.base.subject} in the ${label} scenario.`,
+        source_signal_ids: aggregate.sourceSignalIds,
+        machine_resolvable: aggregate.base.machine_resolvable,
+        suggested_resolution_spec: aggregate.base.suggested_resolution_spec,
+      });
     }
-    pathHypotheses.push({
-      key: aggregate.key,
-      hypothesis_kind: aggregate.base.hypothesis_kind,
-      category: aggregate.base.category,
-      subject: aggregate.base.subject,
-      predicate: aggregate.base.predicate,
-      target_time: aggregate.base.target_time,
-      confidence_score: clamp(Number(item.confidence_score)),
-      reasoning_summary: item.reasoning_summary,
-      source_signal_ids: aggregate.sourceSignalIds,
-      machine_resolvable: aggregate.base.machine_resolvable,
-      suggested_resolution_spec: aggregate.base.suggested_resolution_spec,
-    });
+  } else if (Array.isArray(response.hypotheses)) {
+    for (const item of response.hypotheses) {
+      const aggregate = aggregateMap.get(item.key);
+      if (!aggregate) {
+        continue;
+      }
+      pathHypotheses.push({
+        key: aggregate.key,
+        hypothesis_kind: aggregate.base.hypothesis_kind,
+        category: aggregate.base.category,
+        subject: aggregate.base.subject,
+        predicate: aggregate.base.predicate,
+        target_time: aggregate.base.target_time,
+        confidence_score: clamp(Number(item.confidence_score ?? item.confidence)),
+        reasoning_summary:
+          typeof (item.reasoning_summary ?? item.reasoning) === "string" &&
+          String(item.reasoning_summary ?? item.reasoning).trim().length > 0
+            ? String(item.reasoning_summary ?? item.reasoning)
+            : `${agentId} updated confidence for ${aggregate.base.subject} in the ${label} scenario.`,
+        source_signal_ids: aggregate.sourceSignalIds,
+        machine_resolvable: aggregate.base.machine_resolvable,
+        suggested_resolution_spec: aggregate.base.suggested_resolution_spec,
+      });
+    }
+  } else if (
+    response.scenario &&
+    typeof response.scenario === "object" &&
+    response.scenario.confidence_updates &&
+    typeof response.scenario.confidence_updates === "object"
+  ) {
+    for (const [key, rawConfidence] of Object.entries(response.scenario.confidence_updates)) {
+      const aggregate = aggregateMap.get(key);
+      if (!aggregate) {
+        continue;
+      }
+      pathHypotheses.push({
+        key: aggregate.key,
+        hypothesis_kind: aggregate.base.hypothesis_kind,
+        category: aggregate.base.category,
+        subject: aggregate.base.subject,
+        predicate: aggregate.base.predicate,
+        target_time: aggregate.base.target_time,
+        confidence_score: clamp(Number(rawConfidence)),
+        reasoning_summary: `${agentId} updated confidence for ${aggregate.base.subject} in the ${label} scenario.`,
+        source_signal_ids: aggregate.sourceSignalIds,
+        machine_resolvable: aggregate.base.machine_resolvable,
+        suggested_resolution_spec: aggregate.base.suggested_resolution_spec,
+      });
+    }
+  } else if (response.confidence_updates && typeof response.confidence_updates === "object") {
+    for (const [key, rawConfidence] of Object.entries(response.confidence_updates)) {
+      const aggregate = aggregateMap.get(key);
+      if (!aggregate) {
+        continue;
+      }
+      pathHypotheses.push({
+        key: aggregate.key,
+        hypothesis_kind: aggregate.base.hypothesis_kind,
+        category: aggregate.base.category,
+        subject: aggregate.base.subject,
+        predicate: aggregate.base.predicate,
+        target_time: aggregate.base.target_time,
+        confidence_score: clamp(Number(rawConfidence)),
+        reasoning_summary: `${agentId} updated confidence for ${aggregate.base.subject} in the ${label} scenario.`,
+        source_signal_ids: aggregate.sourceSignalIds,
+        machine_resolvable: aggregate.base.machine_resolvable,
+        suggested_resolution_spec: aggregate.base.suggested_resolution_spec,
+      });
+    }
   }
 
   if (pathHypotheses.length === 0) {
     throw new Error("scenario_llm_produced_no_path_hypotheses");
   }
 
-  const fallbackNarrative = deriveNarrative(worldStates);
-  const proposal: ScenarioPathProposal = {
-    id: randomUUID(),
-    run_id: runId,
-    agent_id: agentId,
-    label,
-    probability: clamp(configuredProbability, 0.05, 0.95),
-    narrative: typeof response.narrative === "string" ? response.narrative : fallbackNarrative,
-    factor_deltas:
-      response.factor_deltas && typeof response.factor_deltas === "object"
-        ? response.factor_deltas
-        : {
-            scenario_label: label,
-            world_state_count: worldStates.length,
-          },
-    path_events: Array.isArray(response.path_events)
+  const narrative =
+    typeof response.narrative === "string" && response.narrative.trim().length > 0
+      ? response.narrative.trim()
+      : typeof response.description === "string" && response.description.trim().length > 0
+        ? response.description.trim()
+        : typeof response.summary === "string" && response.summary.trim().length > 0
+          ? response.summary.trim()
+      : typeof response.scenario?.narrative === "string" && response.scenario.narrative.trim().length > 0
+        ? response.scenario.narrative.trim()
+        : null;
+  if (!narrative) {
+    throw new Error("scenario_llm_response_missing_narrative");
+  }
+  const factorDeltas =
+    response.factor_deltas && typeof response.factor_deltas === "object"
+      ? response.factor_deltas
+      : {
+          scenario_label: label,
+          world_state_count: worldStates.length,
+        };
+  const pathEvents =
+    Array.isArray(response.path_events) && response.path_events.length > 0
       ? response.path_events.map((entry) => ({
           id: randomUUID(),
           title: entry.title,
@@ -465,10 +573,25 @@ async function buildScenarioProposalLlm(
             id: randomUUID(),
             title: `${label} path launched`,
             event_type: "scenario_path",
-            description: fallbackNarrative,
+            description: narrative,
             effective_at: new Date().toISOString(),
           },
-        ],
+        ];
+  const narrativeFromPathEvents =
+    pathEvents.find((entry) => typeof entry.description === "string" && entry.description.trim().length > 0)
+      ?.description ??
+    pathEvents.find((entry) => typeof entry.title === "string" && entry.title.trim().length > 0)?.title ??
+    null;
+
+  const proposal: ScenarioPathProposal = {
+    id: randomUUID(),
+    run_id: runId,
+    agent_id: agentId,
+    label,
+    probability: clamp(configuredProbability, 0.05, 0.95),
+    narrative: narrative ?? narrativeFromPathEvents ?? `${label} scenario path`,
+    factor_deltas: factorDeltas,
+    path_events: pathEvents,
     path_hypotheses: pathHypotheses,
     created_at: new Date().toISOString(),
   };
@@ -529,31 +652,27 @@ async function tick() {
   tickInFlight = true;
   try {
     const runs = await fetchRuns(batchSize);
-    for (const run of runs) {
+    const errors: string[] = [];
+    await runWithConcurrency(runs, runConcurrency, async (run) => {
       const worldStates = await fetchWorldStateProposals(run.id);
       const directHypotheses = await fetchDirectHypotheses(run.id);
       if (worldStates.length === 0 || directHypotheses.length === 0) {
-        continue;
+        return;
       }
 
-      let proposal: ScenarioPathProposal;
-      if (mode === "llm" && llmClient) {
-        try {
-          proposal = await buildScenarioProposalLlm(run.id, worldStates, directHypotheses);
-        } catch (error) {
-          if (llmStrict) {
-            throw error;
-          }
-          app.log.error({ err: error }, "scenario-agent LLM generation failed; falling back to heuristic mode");
-          proposal = buildScenarioProposalHeuristic(run.id, worldStates, directHypotheses);
+      try {
+        if (mode !== "llm" || !llmClient) {
+          throw new Error("scenario_agent_requires_llm_mode");
         }
-      } else {
-        proposal = buildScenarioProposalHeuristic(run.id, worldStates, directHypotheses);
+        const proposal = await buildScenarioProposalLlm(run.id, worldStates, directHypotheses);
+        await upsertScenarioProposal(proposal);
+      } catch (error) {
+        errors.push(`${run.id}:${String(error)}`);
+        app.log.error({ run_id: run.id, error: String(error) }, "scenario_agent_failed_to_process_run");
       }
-      await upsertScenarioProposal(proposal);
-    }
+    });
     lastTickAt = new Date().toISOString();
-    lastTickError = null;
+    lastTickError = errors.length > 0 ? errors.join(" | ").slice(0, 4_000) : null;
   } catch (error) {
     lastTickAt = new Date().toISOString();
     lastTickError = String(error);

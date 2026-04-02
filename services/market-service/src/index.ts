@@ -191,6 +191,37 @@ async function appendStreamEvent(
   );
 }
 
+async function getMarketByProposalId(client: Queryable, proposalId: string) {
+  const result = await client.query<MarketRow>(
+    `
+      SELECT
+        id,
+        proposal_id,
+        event_id,
+        title,
+        subtitle,
+        status,
+        category,
+        close_time,
+        resolution_spec,
+        resolution_source,
+        resolution_kind,
+        resolution_metadata,
+        last_traded_price_yes,
+        volume_24h,
+        liquidity_score,
+        outcomes,
+        rules
+      FROM markets
+      WHERE proposal_id = $1
+      LIMIT 1
+    `,
+    [proposalId],
+  );
+
+  return result.rowCount ? mapMarketRow(result.rows[0]) : null;
+}
+
 app.get("/health", async () => ({ service: "market-service", status: "ok" }));
 
 app.get("/v1/markets", async () => {
@@ -319,34 +350,9 @@ app.post("/v1/internal/markets", async (request, reply) => {
     return { error: "invalid_market_creation_request" };
   }
 
-  const existing = await pool.query<MarketRow>(
-    `
-      SELECT
-        id,
-        proposal_id,
-        event_id,
-        title,
-        subtitle,
-        status,
-        category,
-        close_time,
-        resolution_spec,
-        resolution_source,
-        resolution_kind,
-        resolution_metadata,
-        last_traded_price_yes,
-        volume_24h,
-        liquidity_score,
-        outcomes,
-        rules
-      FROM markets
-      WHERE proposal_id = $1
-    `,
-    [body.proposal_id],
-  );
-
-  if (existing.rowCount) {
-    return mapMarketRow(existing.rows[0]);
+  const existing = await getMarketByProposalId(pool, body.proposal_id);
+  if (existing) {
+    return existing;
   }
 
   const client = await pool.connect();
@@ -377,6 +383,15 @@ app.post("/v1/internal/markets", async (request, reply) => {
         VALUES (
           $1, $2, $3, $4, $5, $6, $7, $8::timestamptz, $9::jsonb, $10, $11, $12::jsonb, $13, $14, $15, $16::jsonb, $17
         )
+        ON CONFLICT (proposal_id) DO UPDATE SET
+          title = EXCLUDED.title,
+          category = EXCLUDED.category,
+          close_time = EXCLUDED.close_time,
+          resolution_spec = EXCLUDED.resolution_spec,
+          resolution_source = EXCLUDED.resolution_source,
+          resolution_kind = EXCLUDED.resolution_kind,
+          resolution_metadata = EXCLUDED.resolution_metadata,
+          rules = EXCLUDED.rules
         RETURNING
           id,
           proposal_id,
@@ -417,7 +432,12 @@ app.post("/v1/internal/markets", async (request, reply) => {
       ],
     );
 
-    const market = mapMarketRow(inserted.rows[0]);
+    const market = inserted.rowCount
+      ? mapMarketRow(inserted.rows[0])
+      : await getMarketByProposalId(client, body.proposal_id);
+    if (!market) {
+      throw new Error("market_upsert_failed");
+    }
     await appendStreamEvent(client, {
       channel: "market.snapshot",
       market_id: market.id,

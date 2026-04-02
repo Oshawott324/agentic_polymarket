@@ -37,12 +37,31 @@ const proposalPipelineUrl = process.env.PROPOSAL_PIPELINE_URL ?? "http://localho
 const proposalAgentId = process.env.PROPOSAL_AGENT_ID ?? "automation-proposal-agent";
 const intervalMs = Number(process.env.PROPOSAL_AGENT_INTERVAL_MS ?? 1000);
 const batchSize = Number(process.env.PROPOSAL_AGENT_BATCH_SIZE ?? 50);
+const beliefConcurrency = Math.max(1, Number(process.env.PROPOSAL_AGENT_BELIEF_CONCURRENCY ?? 8));
 const app = Fastify({ logger: true });
 const pool = createDatabasePool();
 
 let tickInFlight = false;
 let lastTickAt: string | null = null;
 let lastTickError: string | null = null;
+
+async function runWithConcurrency<T>(items: T[], concurrency: number, worker: (item: T) => Promise<void>) {
+  if (items.length === 0) {
+    return;
+  }
+
+  let nextIndex = 0;
+  const workerCount = Math.min(concurrency, items.length);
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (nextIndex < items.length) {
+        const currentIndex = nextIndex;
+        nextIndex += 1;
+        await worker(items[currentIndex]);
+      }
+    }),
+  );
+}
 
 function mapSynthesizedBeliefRow(row: SynthesizedBeliefRow): SynthesizedBelief {
   return {
@@ -220,7 +239,7 @@ async function fetchApprovedBeliefs(limit: number) {
           AND cases.linked_proposal_id = beliefs.linked_proposal_id
         )
       )
-      ORDER BY beliefs.created_at ASC, beliefs.id ASC
+      ORDER BY beliefs.updated_at DESC, beliefs.created_at DESC, beliefs.id DESC
       LIMIT $1
     `,
     [limit],
@@ -333,12 +352,13 @@ async function tick() {
   tickInFlight = true;
   try {
     const beliefs = await fetchApprovedBeliefs(batchSize);
-    for (const belief of beliefs) {
+    const errors: string[] = [];
+    await runWithConcurrency(beliefs, beliefConcurrency, async (belief) => {
       try {
         if (belief.linked_proposal_id) {
           const currentStatus = await fetchProposalStatus(belief.linked_proposal_id);
           if (currentStatus === "published") {
-            continue;
+            return;
           }
         }
 
@@ -359,14 +379,15 @@ async function tick() {
           String(error).includes("belief_resolution_kind_mismatch")
         ) {
           await updateBeliefStatus(belief.id, "suppressed", { reason: String(error) });
-          continue;
+          return;
         }
 
+        errors.push(`${belief.id}:${String(error)}`);
         app.log.error(error);
       }
-    }
+    });
     lastTickAt = new Date().toISOString();
-    lastTickError = null;
+    lastTickError = errors.length > 0 ? errors.join(" | ").slice(0, 4_000) : null;
   } catch (error) {
     lastTickAt = new Date().toISOString();
     lastTickError = String(error);

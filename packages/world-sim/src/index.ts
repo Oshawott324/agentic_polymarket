@@ -7,6 +7,7 @@ export type SourceAdapterKind =
   | "http_csv_price"
   | "http_json_filing"
   | "http_json_official_announcement"
+  | "opencli_command"
   | "x_api_recent_search"
   | "reddit_api_subreddit_new"
   | "news_rss"
@@ -178,6 +179,10 @@ export type BeliefHypothesisProposal = {
   source_signal_ids: string[];
   machine_resolvable: boolean;
   suggested_resolution_spec?: ResolutionSpec;
+  event_case_id?: string | null;
+  case_family_key?: string | null;
+  belief_role?: "primary" | "secondary";
+  publishability_score?: number;
   dedupe_key: string;
   created_at: string;
 };
@@ -243,6 +248,8 @@ export function sourceAdapterToSignalType(adapter: SourceAdapterKind): WorldSign
       return "filing";
     case "http_json_official_announcement":
       return "official_announcement";
+    case "opencli_command":
+      return "news";
     case "market_internal":
       return "market_internal";
     case "x_api_recent_search":
@@ -302,6 +309,7 @@ export function validateWorldInputSourceConfig(config: unknown) {
       "http_csv_price",
       "http_json_filing",
       "http_json_official_announcement",
+      "opencli_command",
       "x_api_recent_search",
       "reddit_api_subreddit_new",
       "news_rss",
@@ -314,6 +322,7 @@ export function validateWorldInputSourceConfig(config: unknown) {
   }
   if (
     candidate.adapter !== "market_internal" &&
+    candidate.adapter !== "opencli_command" &&
     candidate.adapter !== "x_api_recent_search" &&
     candidate.adapter !== "reddit_api_subreddit_new" &&
     !candidate.url

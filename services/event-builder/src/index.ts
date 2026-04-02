@@ -254,14 +254,17 @@ function buildEventCaseCandidate(signal: WorldSignal): EventCase {
 async function fetchRecentSignals(limit: number) {
   const result = await pool.query<WorldSignalRow>(
     `
-      SELECT *
-      FROM world_signals
-      WHERE fetched_at >= NOW() - ($1::text || ' hours')::interval
+      SELECT signals.*
+      FROM world_signals signals
+      LEFT JOIN event_case_signals links
+        ON links.signal_id = signals.id
+      WHERE signals.fetched_at >= NOW() - ($1::text || ' hours')::interval
+        AND links.signal_id IS NULL
         AND NOT (
-          source_type = 'price_feed'
-          AND COALESCE(payload->>'kind', '') = 'price_threshold'
+          signals.source_type = 'price_feed'
+          AND COALESCE(signals.payload->>'kind', '') = 'price_threshold'
         )
-      ORDER BY fetched_at ASC, id ASC
+      ORDER BY signals.fetched_at DESC, signals.id DESC
       LIMIT $2
     `,
     [lookbackHours, limit],

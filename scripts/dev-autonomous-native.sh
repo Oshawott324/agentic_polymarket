@@ -75,5 +75,5 @@ for i in $(seq 1 60); do
   fi
 done
 
-echo "Starting TypeScript services (pnpm dev) with autonomous runtime backend ..."
+echo "Starting autonomous backend services (pnpm dev) with native runtime ..."
 pnpm dev

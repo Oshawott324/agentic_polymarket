@@ -776,9 +776,9 @@ class CamelOasisAdapter:
             target_time = self._target_time_for(signal.effective_at)
             subject = candidate["subject"]
             category = self._category_for_candidate(subject=subject, source_types=source_types, signal=signal)
-            predicate = f"{candidate['summary_title']} will occur by target date"
+            predicate = self._event_occurrence_predicate(signal, candidate["summary_title"])
             kind = "event_occurrence"
-            observation_path = signal.payload.get("observation_occurrence_path")
+            observation_path = signal.payload.get("observation_occurrence_path") or self._default_event_occurrence_path(signal)
             resolution_spec = (
                 self._build_event_occurrence_spec(signal, str(observation_path))
                 if isinstance(observation_path, str) and observation_path.strip()
@@ -813,8 +813,6 @@ class CamelOasisAdapter:
                 threshold = round(current * 1.03, 2) if current > 0 else 100.0
                 predicate = f"{subject} spot price >= {threshold} by target date"
                 resolution_spec = self._build_price_threshold_spec(signal, threshold, "gte")
-            else:
-                predicate = f"{candidate['summary_title']} will still be relevant by target date"
 
             llm_override = next(
                 (
@@ -889,12 +887,26 @@ class CamelOasisAdapter:
             return "crypto" if "BTC" in subject.upper() or "ETH" in subject.upper() else "markets"
         payload_category = signal.payload.get("category")
         if isinstance(payload_category, str) and payload_category.strip():
-            return payload_category.strip().lower()
+            normalized = payload_category.strip().lower()
+            if normalized in {"met", "meteorological", "geo"}:
+                return "weather"
+            return normalized
         if "filing" in source_types:
             return "business"
         if "official_announcement" in source_types:
             return "world"
         return "news"
+
+    def _event_occurrence_predicate(self, signal: Any, summary_title: str) -> str:
+        publishability_class = str(signal.payload.get("publishability_class") or "").strip().lower()
+        event_name = str(signal.payload.get("event_name") or signal.payload.get("event") or summary_title).strip() or summary_title
+        if publishability_class == "official_news":
+            return f"{event_name} will be officially announced by target date"
+        if publishability_class == "weather_event":
+            return f"{event_name} weather event will occur by target date"
+        if publishability_class == "sports_event":
+            return f"{event_name} sports event will occur by target date"
+        return f"{event_name} will occur by target date"
 
     def _build_resolution_source_spec(self, signal: Any, canonical_url: str) -> Dict[str, Any]:
         source: Dict[str, Any] = {
@@ -903,9 +915,24 @@ class CamelOasisAdapter:
             "allowed_domains": [self._domain_of(canonical_url)],
         }
         extraction_mode = signal.payload.get("resolution_extraction_mode")
-        if isinstance(extraction_mode, str) and extraction_mode == "agent_extract":
+        if isinstance(extraction_mode, str) and extraction_mode in {"agent_extract", "deterministic_json"}:
             source["extraction_mode"] = extraction_mode
+        elif self._should_default_agent_extract(signal):
+            source["extraction_mode"] = "agent_extract"
         return source
+
+    def _default_event_occurrence_path(self, signal: Any) -> Optional[str]:
+        explicit = signal.payload.get("observation_occurrence_path")
+        if isinstance(explicit, str) and explicit.strip():
+            return explicit.strip()
+        if self._should_default_agent_extract(signal):
+            return "occurred"
+        return None
+
+    def _should_default_agent_extract(self, signal: Any) -> bool:
+        adapter = str(getattr(signal, "source_adapter", "") or "").strip().lower()
+        trust_tier = str(getattr(signal, "trust_tier", "") or "").strip().lower()
+        return adapter in {"news_rss", "http_json_official_announcement", "opencli_command"} and trust_tier in {"official", "curated"}
 
     def _build_price_threshold_spec(
         self,
@@ -985,7 +1012,7 @@ class CamelOasisAdapter:
         signal: Any,
         observation_path: str,
     ) -> Optional[Dict[str, Any]]:
-        canonical_url = str(signal.payload.get("canonical_source_url") or "").strip()
+        canonical_url = str(signal.payload.get("canonical_source_url") or signal.source_url or "").strip()
         normalized_path = observation_path.strip()
         if not canonical_url or not normalized_path:
             return None
