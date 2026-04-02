@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import Fastify from "fastify";
 import { loadLlmClientFromEnv } from "@automakit/agent-llm";
 import { createDatabasePool, ensureCoreSchema, parseJsonField, toIsoTimestamp } from "@automakit/persistence";
-import type { ResolutionSpec } from "@automakit/sdk-types";
+import type { PriceThresholdDecisionRule, ResolutionExtractionMode, ResolutionSpec } from "@automakit/sdk-types";
 import {
   buildDedupeKey,
   normalizeAllowedDomainsFromUrl,
@@ -94,6 +94,10 @@ type WorldModelLlmResponse = {
     confidence_score: number;
     reasoning_summary: string;
     machine_resolvable?: boolean;
+    price_threshold?: {
+      operator: "gt" | "gte" | "lt" | "lte";
+      threshold: number;
+    };
   }>;
 };
 
@@ -103,20 +107,11 @@ const batchSize = Number(process.env.WORLD_MODEL_BATCH_SIZE ?? 10);
 const agentId = process.env.WORLD_MODEL_AGENT_ID ?? "world-model-alpha";
 const agentProfile = process.env.WORLD_MODEL_AGENT_PROFILE ?? "macro";
 const mode = process.env.WORLD_MODEL_MODE ?? "llm";
-const llmStrict = (process.env.WORLD_MODEL_LLM_STRICT ?? "false").toLowerCase() !== "false";
 const llmClient = (() => {
   if (mode !== "llm") {
     return null;
   }
-  try {
-    return loadLlmClientFromEnv();
-  } catch (error) {
-    if (llmStrict) {
-      throw error;
-    }
-    console.warn("[world-model] llm init failed; using heuristic mode fallback", error);
-    return null;
-  }
+  return loadLlmClientFromEnv();
 })();
 const app = Fastify({ logger: true });
 const pool = createDatabasePool();
@@ -231,111 +226,21 @@ function clamp(value: number, min = 0.05, max = 0.95) {
   return Math.max(min, Math.min(max, value));
 }
 
-function uniqueBy<T>(values: T[], keyFn: (value: T) => string) {
-  const seen = new Set<string>();
-  const output: T[] = [];
-  for (const value of values) {
-    const key = keyFn(value);
-    if (seen.has(key)) {
-      continue;
-    }
-    seen.add(key);
-    output.push(value);
-  }
-  return output;
+function readResolutionExtractionMode(signal: WorldSignal): ResolutionExtractionMode | undefined {
+  return signal.payload.resolution_extraction_mode === "agent_extract" ? "agent_extract" : undefined;
 }
 
-function buildEntities(signals: WorldSignal[]) {
-  const entities: WorldEntityState[] = [];
-
-  for (const signal of signals) {
-    for (const entry of signal.entity_refs) {
-      entities.push({
-        id: `${entry.kind}:${entry.value}`,
-        kind: entry.kind,
-        name: entry.value,
-        attributes: {
-          source_signal_id: signal.id,
-          source_type: signal.source_type,
-        },
-      });
-    }
-  }
-
-  return uniqueBy(entities, (entity) => entity.id);
-}
-
-function buildActiveEvents(signals: WorldSignal[]): ActiveWorldEvent[] {
-  return signals.map((signal) => ({
-    id: signal.id,
-    title: signal.title,
-    event_type: signal.payload.kind && typeof signal.payload.kind === "string" ? signal.payload.kind : signal.source_type,
-    effective_at: signal.effective_at ?? null,
-    source_signal_ids: [signal.id],
-  }));
-}
-
-function buildFactors(signals: WorldSignal[]) {
-  const hasPriceSignal = signals.some((signal) => signal.source_type === "price_feed");
-  const hasCalendarSignal = signals.some((signal) => signal.source_type === "economic_calendar");
-
-  const factors: WorldFactorState[] = [];
-  if (hasPriceSignal) {
-    factors.push({
-      factor: "risk_appetite",
-      value: agentProfile === "market" ? 0.82 : 0.7,
-      direction: "up",
-      rationale: `${agentId} observed price-sensitive momentum across market signals.`,
-    });
-  }
-  if (hasCalendarSignal) {
-    factors.push({
-      factor: "policy_easing_bias",
-      value: agentProfile === "macro" ? 0.8 : 0.68,
-      direction: "up",
-      rationale: `${agentId} inferred easing pressure from calendar and policy signals.`,
-    });
-  }
-  if (!hasPriceSignal && !hasCalendarSignal) {
-    factors.push({
-      factor: "mixed_context",
-      value: 0.5,
-      direction: "flat",
-      rationale: `${agentId} found mixed inputs and no dominant factor.`,
-    });
-  }
-
-  return factors;
-}
-
-function buildRegimeLabels(factors: WorldFactorState[]) {
-  const labels = ["belief-layer"];
-  for (const factor of factors) {
-    if (factor.factor === "risk_appetite" && factor.value >= 0.7) {
-      labels.push("market:risk_on");
-    }
-    if (factor.factor === "policy_easing_bias" && factor.value >= 0.7) {
-      labels.push("macro:easing_bias");
-    }
-  }
-
-  if (labels.length === 1) {
-    labels.push("market:mixed");
-  }
-
-  return labels;
-}
-
-function buildPriceThresholdSpec(signal: WorldSignal): ResolutionSpec | null {
+function buildPriceThresholdSpec(
+  signal: WorldSignal,
+  options: {
+    operator: "gt" | "gte" | "lt" | "lte";
+    threshold: number;
+  },
+): ResolutionSpec | null {
   const assetSymbol =
     typeof signal.payload.asset_symbol === "string" ? signal.payload.asset_symbol : undefined;
-  const threshold = Number(signal.payload.threshold);
-  const operator =
-    signal.payload.operator === "gte" ||
-    signal.payload.operator === "lt" ||
-    signal.payload.operator === "lte"
-      ? signal.payload.operator
-      : "gt";
+  const operator = options.operator;
+  const threshold = options.threshold;
   const canonicalSourceUrl =
     typeof signal.payload.canonical_source_url === "string" ? signal.payload.canonical_source_url : undefined;
   const observationPricePath =
@@ -343,7 +248,7 @@ function buildPriceThresholdSpec(signal: WorldSignal): ResolutionSpec | null {
       ? signal.payload.observation_price_path.trim()
       : "price";
 
-  if (!assetSymbol || !Number.isFinite(threshold) || !canonicalSourceUrl) {
+  if (!assetSymbol || !Number.isFinite(threshold) || !canonicalSourceUrl || threshold <= 0) {
     return null;
   }
 
@@ -353,6 +258,7 @@ function buildPriceThresholdSpec(signal: WorldSignal): ResolutionSpec | null {
       adapter: "http_json",
       canonical_url: canonicalSourceUrl,
       allowed_domains: normalizeAllowedDomainsFromUrl(canonicalSourceUrl),
+      extraction_mode: readResolutionExtractionMode(signal),
     },
     observation_schema: {
       type: "object",
@@ -399,6 +305,7 @@ function buildRateDecisionSpec(signal: WorldSignal): ResolutionSpec | null {
       adapter: "http_json",
       canonical_url: canonicalSourceUrl,
       allowed_domains: normalizeAllowedDomainsFromUrl(canonicalSourceUrl),
+      extraction_mode: readResolutionExtractionMode(signal),
     },
     observation_schema: {
       type: "object",
@@ -428,123 +335,15 @@ function buildRateDecisionSpec(signal: WorldSignal): ResolutionSpec | null {
   };
 }
 
-function buildDirectHypotheses(runId: string, signals: WorldSignal[], regimeLabels: string[]) {
-  const signalIds = signals.map((signal) => signal.id);
-  const combinedSummary = signals.map((signal) => signal.summary).join(" | ");
-  const hypotheses: BeliefHypothesisProposal[] = [];
-
-  for (const signal of signals) {
-    if (signal.payload.kind === "price_threshold") {
-      const spec = buildPriceThresholdSpec(signal);
-      if (!spec) {
-        continue;
-      }
-
-      const assetSymbol =
-        typeof signal.payload.asset_symbol === "string" ? signal.payload.asset_symbol : signal.title;
-      const hasMacroSupport = regimeLabels.includes("macro:easing_bias");
-      const baseConfidence = agentProfile === "market" ? 0.79 : 0.68;
-      const confidence = clamp(baseConfidence + (hasMacroSupport ? 0.05 : 0));
-      const hypothesis: BeliefHypothesisProposal = {
-        id: randomUUID(),
-        run_id: runId,
-        agent_id: agentId,
-        parent_ids: signalIds,
-        hypothesis_kind: "price_threshold",
-        category:
-          typeof signal.payload.category === "string" && signal.payload.category.length > 0
-            ? signal.payload.category
-            : "crypto",
-        subject: assetSymbol,
-        predicate: "price_threshold",
-        target_time:
-          typeof signal.payload.target_time === "string"
-            ? signal.payload.target_time
-            : signal.effective_at ?? new Date().toISOString(),
-        confidence_score: confidence,
-        reasoning_summary: `${agentId} combined market and macro context into a bullish ${assetSymbol} threshold view. ${combinedSummary}`,
-        source_signal_ids: signalIds,
-        machine_resolvable: true,
-        suggested_resolution_spec: spec,
-        dedupe_key: buildDedupeKey({
-          kind: "price_threshold",
-          subject: assetSymbol,
-          target_time:
-            typeof signal.payload.target_time === "string"
-              ? signal.payload.target_time
-              : signal.effective_at ?? new Date().toISOString(),
-          resolution_spec: spec,
-        }),
-        created_at: new Date().toISOString(),
-      };
-      const validation = validateBeliefHypothesisProposal(hypothesis);
-      if (validation.ok) {
-        hypotheses.push(validation.proposal);
-      }
-      continue;
-    }
-
-    if (signal.payload.kind === "rate_decision") {
-      const spec = buildRateDecisionSpec(signal);
-      if (!spec) {
-        continue;
-      }
-
-      const institution =
-        typeof signal.payload.institution === "string" ? signal.payload.institution : signal.title;
-      const hasRiskOnSupport = regimeLabels.includes("market:risk_on");
-      const baseConfidence = agentProfile === "macro" ? 0.81 : 0.72;
-      const confidence = clamp(baseConfidence + (hasRiskOnSupport ? 0.03 : 0));
-      const hypothesis: BeliefHypothesisProposal = {
-        id: randomUUID(),
-        run_id: runId,
-        agent_id: agentId,
-        parent_ids: signalIds,
-        hypothesis_kind: "rate_decision",
-        category:
-          typeof signal.payload.category === "string" && signal.payload.category.length > 0
-            ? signal.payload.category
-            : "macro",
-        subject: institution,
-        predicate: `rate_decision_${signal.payload.direction === "hold" || signal.payload.direction === "hike" ? signal.payload.direction : "cut"}`,
-        target_time:
-          typeof signal.payload.target_time === "string"
-            ? signal.payload.target_time
-            : signal.effective_at ?? new Date().toISOString(),
-        confidence_score: confidence,
-        reasoning_summary: `${agentId} combined calendar and market context into a ${institution} policy view. ${combinedSummary}`,
-        source_signal_ids: signalIds,
-        machine_resolvable: true,
-        suggested_resolution_spec: spec,
-        dedupe_key: buildDedupeKey({
-          kind: "rate_decision",
-          subject: institution,
-          target_time:
-            typeof signal.payload.target_time === "string"
-              ? signal.payload.target_time
-              : signal.effective_at ?? new Date().toISOString(),
-          resolution_spec: spec,
-        }),
-        created_at: new Date().toISOString(),
-      };
-      const validation = validateBeliefHypothesisProposal(hypothesis);
-      if (validation.ok) {
-        hypotheses.push(validation.proposal);
-      }
-    }
-  }
-
-  return hypotheses;
-}
-
 function buildWorldModelLlmSystemPrompt() {
   return [
     "You are a world-model agent in an autonomous prediction-market platform.",
     "Return strict JSON only.",
     "Generate one world_state object and a hypotheses array.",
     "Each hypothesis must map to one input signal via source_signal_id.",
-    "Use only these hypothesis kinds: price_threshold, rate_decision, filing_detected, game_result.",
+    "Use only these hypothesis kinds: price_threshold, rate_decision, event_occurrence.",
     "Set confidence_score in [0,1].",
+    "For price_threshold hypotheses, always include price_threshold.operator and price_threshold.threshold.",
     "Never hallucinate source ids.",
   ].join(" ");
 }
@@ -616,7 +415,13 @@ async function generateWithLlm(runId: string, triggerSignalIds: string[], signal
 
     let suggestedResolutionSpec: ResolutionSpec | undefined;
     if (item.hypothesis_kind === "price_threshold") {
-      suggestedResolutionSpec = buildPriceThresholdSpec(signal) ?? undefined;
+      if (!item.price_threshold) {
+        continue;
+      }
+      suggestedResolutionSpec = buildPriceThresholdSpec(signal, {
+        operator: item.price_threshold.operator,
+        threshold: item.price_threshold.threshold,
+      }) ?? undefined;
     } else if (item.hypothesis_kind === "rate_decision") {
       suggestedResolutionSpec = buildRateDecisionSpec(signal) ?? undefined;
     }
@@ -659,35 +464,6 @@ async function generateWithLlm(runId: string, triggerSignalIds: string[], signal
   return {
     worldStateProposal: stateValidation.proposal,
     hypotheses,
-  };
-}
-
-function generateHeuristic(runId: string, triggerSignalIds: string[], signals: WorldSignal[]) {
-  const entities = buildEntities(signals);
-  const activeEvents = buildActiveEvents(signals);
-  const factors = buildFactors(signals);
-  const regimeLabels = buildRegimeLabels(factors);
-  const worldStateProposal: WorldStateProposal = {
-    id: randomUUID(),
-    run_id: runId,
-    agent_id: agentId,
-    source_signal_ids: triggerSignalIds,
-    as_of: new Date().toISOString(),
-    entities,
-    active_events: activeEvents,
-    factors,
-    regime_labels: regimeLabels,
-    reasoning_summary: `${agentId} proposed a world-state interpretation across ${signals.length} signals using the ${agentProfile} profile.`,
-    created_at: new Date().toISOString(),
-  };
-  const stateValidation = validateWorldStateProposal(worldStateProposal);
-  if (!stateValidation.ok) {
-    throw new Error(`invalid_world_state_proposal:${stateValidation.errors.join(",")}`);
-  }
-
-  return {
-    worldStateProposal: stateValidation.proposal,
-    hypotheses: buildDirectHypotheses(runId, signals, regimeLabels),
   };
 }
 
@@ -800,19 +576,10 @@ async function processRun(runId: string, triggerSignalIds: string[]) {
       }
     | undefined;
 
-  if (mode === "llm" && llmClient) {
-    try {
-      output = await generateWithLlm(runId, triggerSignalIds, signals);
-    } catch (error) {
-      if (llmStrict) {
-        throw error;
-      }
-      app.log.error({ err: error }, "world-model LLM generation failed; falling back to heuristic mode");
-      output = generateHeuristic(runId, triggerSignalIds, signals);
-    }
-  } else {
-    output = generateHeuristic(runId, triggerSignalIds, signals);
+  if (mode !== "llm" || !llmClient) {
+    throw new Error("world_model_requires_llm_mode_and_client");
   }
+  output = await generateWithLlm(runId, triggerSignalIds, signals);
 
   await upsertWorldStateProposal(output.worldStateProposal);
   for (const hypothesis of output.hypotheses) {

@@ -4,6 +4,7 @@ import type { ResolutionKind, ResolutionSpec } from "@automakit/sdk-types";
 export type SourceAdapterKind =
   | "http_json_calendar"
   | "http_json_price"
+  | "http_csv_price"
   | "http_json_filing"
   | "http_json_official_announcement"
   | "x_api_recent_search"
@@ -236,6 +237,7 @@ export function sourceAdapterToSignalType(adapter: SourceAdapterKind): WorldSign
     case "http_json_calendar":
       return "economic_calendar";
     case "http_json_price":
+    case "http_csv_price":
       return "price_feed";
     case "http_json_filing":
       return "filing";
@@ -297,6 +299,7 @@ export function validateWorldInputSourceConfig(config: unknown) {
     ![
       "http_json_calendar",
       "http_json_price",
+      "http_csv_price",
       "http_json_filing",
       "http_json_official_announcement",
       "x_api_recent_search",
@@ -414,8 +417,7 @@ function isResolutionKind(value: unknown): value is ResolutionKind {
   return (
     value === "price_threshold" ||
     value === "rate_decision" ||
-    value === "filing_detected" ||
-    value === "game_result"
+    value === "event_occurrence"
   );
 }
 

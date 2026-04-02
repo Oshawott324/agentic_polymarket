@@ -49,6 +49,7 @@ docs/
 
 - [Product Requirements Document](./docs/prd.md)
 - [System Architecture](./docs/architecture.md)
+- [Forecast-Emergence Architecture Plan](./docs/forecast-emergence-architecture.md)
 - [Agent Automation Roadmap](./docs/roadmap-agent-automation.md)
 - [Agent Operations](./docs/agent-operations.md)
 - [Agent Simulation Fabric Spec](./docs/world-model-implementation-spec.md)
@@ -102,8 +103,8 @@ The current autonomous market-generation loop is:
 
 1. `services/world-input` polls configured upstream sources and writes normalized `world_signals`.
 2. `services/event-builder` deterministically clusters fresh signals into `event_cases` (facts-layer, no market logic), and ignores legacy synthetic `price_threshold` signals.
-3. `services/simulation-orchestrator` creates and advances simulation runs over those signals.
-4. `services/world-model` emits `world_state_proposals` and direct `belief_hypothesis_proposals`.
+3. `services/simulation-orchestrator` creates and advances simulation runs over fresh `event_cases` plus their supporting `world_signals`.
+4. `services/world-model` emits `world_state_proposals` and direct forecast `belief_hypothesis_proposals`.
 5. `services/scenario-agent` emits alternative `scenario_path_proposals`.
 6. `services/synthesis-agent` merges agent outputs into `synthesized_beliefs`.
 7. `services/proposal-agent` converts eligible synthesized beliefs into machine-resolvable proposals.
@@ -112,9 +113,9 @@ The current autonomous market-generation loop is:
 The next target loop extends this with external social feeds and an agent approval gate:
 
 1. feed ingestors pull X/Twitter, Reddit, and other configured sources into normalized `world_signals`.
-2. `services/simulation-orchestrator` batches candidate signals and starts simulation runs.
+2. `services/simulation-orchestrator` batches candidate event cases and supporting evidence into simulation runs.
 3. a Python simulation runtime (CAMEL/Oasis-compatible) executes world-model and scenario agents.
-4. synthesis agents emit typed hypotheses with confidence and disagreement metadata.
+4. synthesis agents emit typed hypotheses with confidence and disagreement metadata, including broader `event_occurrence` forecasts that may or may not yet be listable.
 5. approval agents evaluate resolvability, source quality, and manipulation risk.
 6. only quorum-approved hypotheses continue to `proposal-agent` and `proposal-pipeline`.
 

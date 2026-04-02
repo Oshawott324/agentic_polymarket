@@ -193,7 +193,7 @@ class CamelOasisAdapter:
             )
             await env.reset()
 
-            round_subjects = self._top_subjects_from_signals(request, limit=5)
+            round_subjects = self._top_subjects(request, limit=5)
             for round_index in range(self.oasis_native.rounds):
                 selected_ids = self._select_active_ids(len(roles))
                 simulation_summary["active_agent_counts"].append(len(selected_ids))
@@ -371,6 +371,7 @@ class CamelOasisAdapter:
     ) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
         signal_ids = [signal.id for signal in request.signals]
         top_signal = request.signals[-1] if request.signals else None
+        event_cases = list(request.event_cases)
 
         llm_payload = await self._chat_json(
             system_prompt=(
@@ -381,6 +382,7 @@ class CamelOasisAdapter:
                 "run_id": request.run_id,
                 "agent_id": agent_id,
                 "signals": [signal.model_dump() for signal in request.signals],
+                "event_cases": [event_case.model_dump() for event_case in event_cases],
                 "simulation_summary": simulation_summary or {},
             },
         )
@@ -391,25 +393,52 @@ class CamelOasisAdapter:
         if not regime_labels:
             regime_labels = ["mixed_regime"]
 
-        reasoning_summary = f"{agent_id} processed {len(request.signals)} signals."
+        reasoning_summary = (
+            f"{agent_id} processed {len(event_cases)} event cases backed by "
+            f"{len(request.signals)} signals."
+            if event_cases
+            else f"{agent_id} processed {len(request.signals)} signals."
+        )
         if simulation_summary:
             trace_rows = int(simulation_summary.get("trace_rows", 0))
             rounds = int(simulation_summary.get("rounds", 0))
             reasoning_summary = (
-                f"{agent_id} processed {len(request.signals)} signals after "
+                f"{agent_id} processed {len(event_cases) if event_cases else len(request.signals)} "
+                f"{'event cases' if event_cases else 'signals'} after "
                 f"{rounds} simulation rounds with {trace_rows} trace events."
             )
         if isinstance(llm_payload, dict) and isinstance(llm_payload.get("reasoning_summary"), str):
             reasoning_summary = llm_payload["reasoning_summary"][:500]
 
         entities = []
+        seen_entity_ids: set[str] = set()
+        for event_case in event_cases:
+            entity_name = str(event_case.primary_entity or event_case.title).strip()
+            entity_id = f"event:{event_case.id}"
+            if entity_name and entity_id not in seen_entity_ids:
+                seen_entity_ids.add(entity_id)
+                entities.append(
+                    {
+                        "id": entity_id,
+                        "kind": "event",
+                        "name": entity_name,
+                        "attributes": {
+                            "event_case_id": event_case.id,
+                            "event_case_kind": event_case.kind,
+                        },
+                    }
+                )
         for signal in request.signals:
             for ref in signal.entity_refs:
                 kind = str(ref.get("kind", "event"))
                 value = str(ref.get("value", "unknown"))
+                entity_id = f"{kind}:{value}"
+                if entity_id in seen_entity_ids:
+                    continue
+                seen_entity_ids.add(entity_id)
                 entities.append(
                     {
-                        "id": f"{kind}:{value}",
+                        "id": entity_id,
                         "kind": kind,
                         "name": value,
                         "attributes": {
@@ -429,14 +458,19 @@ class CamelOasisAdapter:
                 }
             )
 
-        world_state = {
-            "id": str(uuid4()),
-            "run_id": request.run_id,
-            "agent_id": agent_id,
-            "source_signal_ids": signal_ids,
-            "as_of": now_iso(),
-            "entities": entities,
-            "active_events": [
+        active_events = (
+            [
+                {
+                    "id": event_case.id,
+                    "title": event_case.title,
+                    "event_type": event_case.kind,
+                    "effective_at": event_case.last_signal_at,
+                    "source_signal_ids": list(event_case.source_signal_ids),
+                }
+                for event_case in event_cases
+            ]
+            if event_cases
+            else [
                 {
                     "id": signal.id,
                     "title": signal.title,
@@ -445,13 +479,35 @@ class CamelOasisAdapter:
                     "source_signal_ids": [signal.id],
                 }
                 for signal in request.signals
-            ],
+            ]
+        )
+
+        observed_types = {
+            source_type
+            for event_case in event_cases
+            for source_type in event_case.source_types
+        } or {signal.source_type for signal in request.signals}
+
+        world_state = {
+            "id": str(uuid4()),
+            "run_id": request.run_id,
+            "agent_id": agent_id,
+            "source_signal_ids": signal_ids,
+            "as_of": now_iso(),
+            "entities": entities,
+            "active_events": active_events,
             "factors": [
                 {
-                    "factor": "signal_velocity",
-                    "value": clamp(len(request.signals) / 10, 0.2, 0.9),
+                    "factor": "event_flow",
+                    "value": clamp(len(active_events) / 8, 0.2, 0.95),
                     "direction": "up",
-                    "rationale": f"{agent_id} observed persistent upstream activity.",
+                    "rationale": f"{agent_id} observed persistent upstream event activity.",
+                },
+                {
+                    "factor": "source_diversity",
+                    "value": clamp(len(observed_types) / 5, 0.2, 0.95),
+                    "direction": "up" if len(observed_types) >= 3 else "flat",
+                    "rationale": f"{agent_id} observed {len(observed_types)} source-type buckets in the current context.",
                 }
             ],
             "regime_labels": regime_labels,
@@ -671,73 +727,109 @@ class CamelOasisAdapter:
         llm_payload: Any,
     ) -> List[Dict[str, Any]]:
         hypotheses: List[Dict[str, Any]] = []
+        signal_map = {signal.id: signal for signal in request.signals}
 
         llm_hypotheses = []
         if isinstance(llm_payload, dict) and isinstance(llm_payload.get("hypotheses"), list):
             llm_hypotheses = [entry for entry in llm_payload["hypotheses"] if isinstance(entry, dict)]
 
-        for signal in request.signals:
-            source_kind = signal.source_type
-            target_time = (utc_now() + timedelta(days=3)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-            category = "macro"
-            subject = signal.payload.get("asset_symbol") or signal.payload.get("institution") or signal.title
-            predicate = "event will occur"
-            kind = "price_threshold"
-            resolution_spec: Dict[str, Any]
+        candidates: List[Dict[str, Any]] = []
+        if request.event_cases:
+            for event_case in request.event_cases:
+                linked_signals = [
+                    signal_map[signal_id]
+                    for signal_id in event_case.source_signal_ids
+                    if signal_id in signal_map
+                ]
+                anchor_signal = linked_signals[-1] if linked_signals else (request.signals[-1] if request.signals else None)
+                if anchor_signal is None:
+                    continue
+                candidates.append(
+                    {
+                        "event_case_id": event_case.id,
+                        "event_case_kind": event_case.kind,
+                        "source_signal_ids": [signal.id for signal in linked_signals] or [anchor_signal.id],
+                        "signal": anchor_signal,
+                        "subject": str(event_case.primary_entity or anchor_signal.title),
+                        "summary_title": event_case.title,
+                        "source_types": list(event_case.source_types),
+                    }
+                )
+        else:
+            for signal in request.signals:
+                candidates.append(
+                    {
+                        "event_case_id": None,
+                        "event_case_kind": signal.source_type,
+                        "source_signal_ids": [signal.id],
+                        "signal": signal,
+                        "subject": str(signal.payload.get("asset_symbol") or signal.payload.get("institution") or signal.title),
+                        "summary_title": signal.title,
+                        "source_types": [signal.source_type],
+                    }
+                )
 
-            if source_kind == "economic_calendar":
+        for candidate in candidates:
+            signal = candidate["signal"]
+            source_types = set(candidate["source_types"])
+            source_kind = signal.source_type
+            target_time = self._target_time_for(signal.effective_at)
+            subject = candidate["subject"]
+            category = self._category_for_candidate(subject=subject, source_types=source_types, signal=signal)
+            predicate = f"{candidate['summary_title']} will occur by target date"
+            kind = "event_occurrence"
+            observation_path = signal.payload.get("observation_occurrence_path")
+            resolution_spec = (
+                self._build_event_occurrence_spec(signal, str(observation_path))
+                if isinstance(observation_path, str) and observation_path.strip()
+                else None
+            )
+
+            if "economic_calendar" in source_types or source_kind == "economic_calendar":
                 kind = "rate_decision"
                 category = "economy"
-                institution = str(signal.payload.get("institution") or "Federal Reserve")
+                institution = str(signal.payload.get("institution") or subject or "Federal Reserve")
                 subject = institution
-                direction = str(signal.payload.get("expected_direction") or "hold").lower()
+                direction = str(
+                    signal.payload.get("expected_direction")
+                    or signal.payload.get("direction")
+                    or "hold"
+                ).lower()
                 if direction not in {"cut", "hold", "hike"}:
                     direction = "hold"
                 predicate = f"{institution} will {direction} rates by target date"
-                resolution_spec = {
-                    "kind": "rate_decision",
-                    "source": {
-                        "canonical_url": signal.source_url,
-                        "allowed_domains": [self._domain_of(signal.source_url)],
-                        "adapter": "http_json",
-                    },
-                    "observation_schema": {"required": ["direction", "effective_at"]},
-                    "decision_rule": {"direction": direction},
-                    "quorum_rule": {"threshold": 2},
-                    "quarantine_rule": {"on_conflict": "quarantine"},
-                }
-            else:
+                resolution_spec = self._build_rate_decision_spec(signal, direction)
+            elif "price_feed" in source_types or source_kind == "price_feed":
                 kind = "price_threshold"
-                category = "crypto" if "BTC" in str(subject).upper() or "ETH" in str(subject).upper() else "markets"
                 try:
-                    current = float(signal.payload.get("price", 0))
+                    current = float(
+                        signal.payload.get("price")
+                        or signal.payload.get("close")
+                        or signal.payload.get("current_price")
+                        or 0
+                    )
                 except Exception:
                     current = 0.0
                 threshold = round(current * 1.03, 2) if current > 0 else 100.0
                 predicate = f"{subject} spot price >= {threshold} by target date"
-                resolution_spec = {
-                    "kind": "price_threshold",
-                    "source": {
-                        "canonical_url": signal.source_url,
-                        "allowed_domains": [self._domain_of(signal.source_url)],
-                        "adapter": "http_json",
-                    },
-                    "observation_schema": {"required": ["price", "timestamp"]},
-                    "decision_rule": {"operator": "gte", "threshold": threshold},
-                    "quorum_rule": {"threshold": 2},
-                    "quarantine_rule": {"on_conflict": "quarantine"},
-                }
+                resolution_spec = self._build_price_threshold_spec(signal, threshold, "gte")
+            else:
+                predicate = f"{candidate['summary_title']} will still be relevant by target date"
 
             llm_override = next(
                 (
                     item
                     for item in llm_hypotheses
-                    if str(item.get("source_signal_id", "")) == signal.id
+                    if str(item.get("source_signal_id", "")) in candidate["source_signal_ids"]
+                    or str(item.get("event_case_id", "")) == str(candidate.get("event_case_id") or "")
                 ),
                 None,
             )
-            confidence = 0.58
-            reasoning = f"{agent_id} formed a hypothesis from signal {signal.id}."
+            confidence = 0.54 if kind == "event_occurrence" else 0.58
+            reasoning = (
+                f"{agent_id} formed a {kind} hypothesis from "
+                f"{'event case ' + str(candidate['event_case_id']) if candidate.get('event_case_id') else 'signal ' + signal.id}."
+            )
             if isinstance(llm_override, dict):
                 if isinstance(llm_override.get("confidence_score"), (int, float)):
                     confidence = clamp(float(llm_override["confidence_score"]))
@@ -746,12 +838,14 @@ class CamelOasisAdapter:
 
             key = {
                 "run_id": request.run_id,
-                "signal_id": signal.id,
+                "signal_ids": candidate["source_signal_ids"],
+                "event_case_id": candidate.get("event_case_id"),
                 "kind": kind,
                 "subject": subject,
                 "predicate": predicate,
                 "target_time": target_time,
             }
+            machine_resolvable = resolution_spec is not None
             hypotheses.append(
                 {
                     "id": str(uuid4()),
@@ -765,14 +859,163 @@ class CamelOasisAdapter:
                     "target_time": target_time,
                     "confidence_score": confidence,
                     "reasoning_summary": reasoning,
-                    "source_signal_ids": [signal.id],
-                    "machine_resolvable": True,
+                    "source_signal_ids": candidate["source_signal_ids"],
+                    "machine_resolvable": machine_resolvable,
                     "suggested_resolution_spec": resolution_spec,
                     "dedupe_key": dedupe_key(key),
                     "created_at": now_iso(),
                 }
             )
         return hypotheses
+
+    def _target_time_for(self, effective_at: Optional[str]) -> str:
+        if effective_at:
+            try:
+                base = datetime.fromisoformat(effective_at.replace("Z", "+00:00"))
+                return (base + timedelta(days=3)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            except Exception:
+                pass
+        return (utc_now() + timedelta(days=3)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    def _category_for_candidate(
+        self,
+        subject: str,
+        source_types: set[str],
+        signal: Any,
+    ) -> str:
+        if "economic_calendar" in source_types:
+            return "economy"
+        if "price_feed" in source_types:
+            return "crypto" if "BTC" in subject.upper() or "ETH" in subject.upper() else "markets"
+        payload_category = signal.payload.get("category")
+        if isinstance(payload_category, str) and payload_category.strip():
+            return payload_category.strip().lower()
+        if "filing" in source_types:
+            return "business"
+        if "official_announcement" in source_types:
+            return "world"
+        return "news"
+
+    def _build_resolution_source_spec(self, signal: Any, canonical_url: str) -> Dict[str, Any]:
+        source: Dict[str, Any] = {
+            "adapter": "http_json",
+            "canonical_url": canonical_url,
+            "allowed_domains": [self._domain_of(canonical_url)],
+        }
+        extraction_mode = signal.payload.get("resolution_extraction_mode")
+        if isinstance(extraction_mode, str) and extraction_mode == "agent_extract":
+            source["extraction_mode"] = extraction_mode
+        return source
+
+    def _build_price_threshold_spec(
+        self,
+        signal: Any,
+        threshold: float,
+        operator: str,
+    ) -> Optional[Dict[str, Any]]:
+        canonical_url = str(signal.payload.get("canonical_source_url") or signal.source_url or "").strip()
+        if not canonical_url or threshold <= 0:
+            return None
+        observation_path = str(signal.payload.get("observation_price_path") or "price").strip() or "price"
+        return {
+            "kind": "price_threshold",
+            "source": self._build_resolution_source_spec(signal, canonical_url),
+            "observation_schema": {
+                "type": "object",
+                "fields": {
+                    "price": {"type": "number", "path": observation_path},
+                    "observed_at": {"type": "string", "path": "observed_at", "required": False},
+                },
+            },
+            "decision_rule": {
+                "kind": "price_threshold",
+                "observation_field": "price",
+                "operator": operator,
+                "threshold": threshold,
+            },
+            "quorum_rule": {
+                "min_observations": 2,
+                "min_distinct_collectors": 2,
+                "agreement": "all",
+            },
+            "quarantine_rule": {
+                "on_source_fetch_failure": True,
+                "on_schema_validation_failure": True,
+                "on_observation_conflict": True,
+                "max_observation_age_seconds": 3600,
+            },
+        }
+
+    def _build_rate_decision_spec(self, signal: Any, direction: str) -> Optional[Dict[str, Any]]:
+        canonical_url = str(signal.payload.get("canonical_source_url") or signal.source_url or "").strip()
+        if not canonical_url:
+            return None
+        return {
+            "kind": "rate_decision",
+            "source": self._build_resolution_source_spec(signal, canonical_url),
+            "observation_schema": {
+                "type": "object",
+                "fields": {
+                    "previous_upper_bound_bps": {"type": "number", "path": "previous_upper_bound_bps"},
+                    "current_upper_bound_bps": {"type": "number", "path": "current_upper_bound_bps"},
+                    "observed_at": {"type": "string", "path": "observed_at", "required": False},
+                },
+            },
+            "decision_rule": {
+                "kind": "rate_decision",
+                "previous_field": "previous_upper_bound_bps",
+                "current_field": "current_upper_bound_bps",
+                "direction": direction,
+            },
+            "quorum_rule": {
+                "min_observations": 2,
+                "min_distinct_collectors": 2,
+                "agreement": "all",
+            },
+            "quarantine_rule": {
+                "on_source_fetch_failure": True,
+                "on_schema_validation_failure": True,
+                "on_observation_conflict": True,
+                "max_observation_age_seconds": 3600,
+            },
+        }
+
+    def _build_event_occurrence_spec(
+        self,
+        signal: Any,
+        observation_path: str,
+    ) -> Optional[Dict[str, Any]]:
+        canonical_url = str(signal.payload.get("canonical_source_url") or "").strip()
+        normalized_path = observation_path.strip()
+        if not canonical_url or not normalized_path:
+            return None
+        return {
+            "kind": "event_occurrence",
+            "source": self._build_resolution_source_spec(signal, canonical_url),
+            "observation_schema": {
+                "type": "object",
+                "fields": {
+                    "occurred": {"type": "boolean", "path": normalized_path},
+                    "observed_at": {"type": "string", "path": "observed_at", "required": False},
+                },
+            },
+            "decision_rule": {
+                "kind": "event_occurrence",
+                "observation_field": "occurred",
+                "expected_value": True,
+            },
+            "quorum_rule": {
+                "min_observations": 2,
+                "min_distinct_collectors": 2,
+                "agreement": "all",
+            },
+            "quarantine_rule": {
+                "on_source_fetch_failure": True,
+                "on_schema_validation_failure": True,
+                "on_observation_conflict": True,
+                "max_observation_age_seconds": 3600,
+            },
+        }
 
     async def _chat_json(self, system_prompt: str, user_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if self.llm is None:
@@ -927,8 +1170,15 @@ class CamelOasisAdapter:
             return row_count, action_counts
         return row_count, action_counts
 
-    def _top_subjects_from_signals(self, request: SimulationRunRequestV1, limit: int = 5) -> List[str]:
+    def _top_subjects(self, request: SimulationRunRequestV1, limit: int = 5) -> List[str]:
         subjects: List[str] = []
+        for event_case in request.event_cases:
+            raw = event_case.primary_entity or event_case.title
+            value = str(raw).strip()
+            if value and value not in subjects:
+                subjects.append(value)
+            if len(subjects) >= limit:
+                return subjects
         for signal in request.signals:
             raw = signal.payload.get("asset_symbol") or signal.payload.get("institution") or signal.title
             value = str(raw).strip()

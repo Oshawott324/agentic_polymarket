@@ -236,6 +236,7 @@ function sourceKindFromAdapter(adapter: WorldInputAdapterKind): string {
     case "http_json_calendar":
       return "calendar";
     case "http_json_price":
+    case "http_csv_price":
       return "price";
     case "http_json_filing":
       return "filing";
@@ -301,6 +302,27 @@ function extractXmlLink(block: string) {
     return atomLink[1].trim();
   }
   return extractXmlTag(block, "link");
+}
+
+function parseCompactUtcTimestamp(dateRaw: string | null, timeRaw: string | null) {
+  if (!dateRaw || !/^\d{8}$/.test(dateRaw)) {
+    return null;
+  }
+  const year = Number(dateRaw.slice(0, 4));
+  const month = Number(dateRaw.slice(4, 6));
+  const day = Number(dateRaw.slice(6, 8));
+  if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day)) {
+    return null;
+  }
+
+  const hh = timeRaw && /^\d{6}$/.test(timeRaw) ? Number(timeRaw.slice(0, 2)) : 0;
+  const mm = timeRaw && /^\d{6}$/.test(timeRaw) ? Number(timeRaw.slice(2, 4)) : 0;
+  const ss = timeRaw && /^\d{6}$/.test(timeRaw) ? Number(timeRaw.slice(4, 6)) : 0;
+  const millis = Date.UTC(year, month - 1, day, hh, mm, ss, 0);
+  if (!Number.isFinite(millis)) {
+    return null;
+  }
+  return new Date(millis).toISOString();
 }
 
 function parseRssEntries(xml: string) {
@@ -554,6 +576,88 @@ async function fetchHttpJsonSourceItems(source: SourceWithConfig): Promise<Sourc
   };
 }
 
+async function fetchHttpCsvPriceItems(source: SourceWithConfig): Promise<SourcePollResult> {
+  if (!source.source_url) {
+    throw new Error(`world_input_source_url_missing:${source.key}`);
+  }
+
+  const response = await fetch(source.source_url, {
+    headers: {
+      accept: "text/csv,text/plain,*/*",
+    },
+  });
+  if (!response.ok) {
+    throw new Error(`world_input_source_fetch_failed:${source.key}:${response.status}`);
+  }
+
+  const text = await response.text();
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+
+  if (lines.length === 0) {
+    return {
+      items: [],
+      next_cursor: source.cursor_value,
+      metadata: { adapter: source.adapter, format: "csv", row_count: 0 },
+    };
+  }
+
+  const config = source.config_json;
+  const lineIndex = Math.max(0, Number(asNumber(config.line_index) ?? 0));
+  const dataLine = lines[Math.min(lineIndex, lines.length - 1)];
+  const cells = dataLine.split(",").map((cell) => cell.trim());
+
+  const symbolIndex = Math.max(0, Number(asNumber(config.symbol_index) ?? 0));
+  const dateIndex = Math.max(0, Number(asNumber(config.date_index) ?? 1));
+  const timeIndex = Math.max(0, Number(asNumber(config.time_index) ?? 2));
+  const openIndex = Math.max(0, Number(asNumber(config.open_index) ?? 3));
+  const highIndex = Math.max(0, Number(asNumber(config.high_index) ?? 4));
+  const lowIndex = Math.max(0, Number(asNumber(config.low_index) ?? 5));
+  const closeIndex = Math.max(0, Number(asNumber(config.close_index) ?? 6));
+  const volumeIndex = Math.max(0, Number(asNumber(config.volume_index) ?? 7));
+
+  const symbol = asString(cells[symbolIndex]) ?? asString(config.symbol_hint) ?? source.key;
+  const dateRaw = asString(cells[dateIndex]);
+  const timeRaw = asString(cells[timeIndex]);
+  const close = asNumber(cells[closeIndex]);
+  if (close === null || close <= 0) {
+    throw new Error(`world_input_source_csv_close_invalid:${source.key}`);
+  }
+  const observedAt = parseCompactUtcTimestamp(dateRaw, timeRaw) ?? new Date().toISOString();
+  const sourceId = buildDedupeKey({
+    source_key: source.key,
+    symbol,
+    observed_at: observedAt,
+    close,
+  });
+
+  return {
+    items: [
+      {
+        source_id: sourceId,
+        source_url: source.source_url,
+        title: `${symbol} spot price observed`,
+        summary: `${symbol} observed at ${close}.`,
+        effective_at: observedAt,
+        payload: {
+          symbol,
+          date: dateRaw,
+          time: timeRaw,
+          open: asNumber(cells[openIndex]),
+          high: asNumber(cells[highIndex]),
+          low: asNumber(cells[lowIndex]),
+          close,
+          volume: asNumber(cells[volumeIndex]),
+        },
+      },
+    ],
+    next_cursor: source.cursor_value,
+    metadata: { adapter: source.adapter, format: "csv", row_count: 1 },
+  };
+}
+
 async function fetchXRecentSearchItems(source: SourceWithConfig): Promise<SourcePollResult> {
   const config = source.config_json;
   const query = asString(config.query);
@@ -763,9 +867,12 @@ async function fetchSourceItems(source: SourceWithConfig): Promise<SourcePollRes
       return fetchNewsRssItems(source);
     case "http_json_calendar":
     case "http_json_price":
+    case "http_csv_price":
     case "http_json_filing":
     case "http_json_official_announcement":
-      return fetchHttpJsonSourceItems(source);
+      return source.adapter === "http_csv_price"
+        ? fetchHttpCsvPriceItems(source)
+        : fetchHttpJsonSourceItems(source);
     default:
       throw new Error(`world_input_source_adapter_unsupported:${source.adapter}`);
   }
@@ -830,7 +937,7 @@ function expandHttpJsonPriceItems(source: SourceWithConfig, items: Record<string
 }
 
 function expandSourceItems(source: SourceWithConfig, items: Record<string, unknown>[]) {
-  if (source.adapter === "http_json_price") {
+  if (source.adapter === "http_json_price" || source.adapter === "http_csv_price") {
     return expandHttpJsonPriceItems(source, items);
   }
   return items;

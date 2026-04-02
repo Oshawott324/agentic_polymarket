@@ -20,6 +20,15 @@ export type RuntimeCollectedObservation = {
   summary: string;
 };
 
+export type RuntimeFetchedSourceDocument = {
+  source_url: string;
+  source_hash: string;
+  source_adapter: ResolutionSourceAdapter;
+  fetched_at: string;
+  content_type: string | null;
+  raw_body: string;
+};
+
 export class ResolutionRuntimeError extends Error {
   code: string;
 
@@ -54,6 +63,10 @@ export function summarizeObservation(
 ) {
   if (spec.kind === "price_threshold") {
     return `Collected price observation for ${String(payload[spec.decision_rule.observation_field])}; derived ${outcome}.`;
+  }
+
+  if (spec.kind === "event_occurrence") {
+    return `Collected event occurrence observation (${String(payload[spec.decision_rule.observation_field])}); derived ${outcome}.`;
   }
 
   return `Collected rate decision observation (${String(payload[spec.decision_rule.previous_field])} -> ${String(payload[spec.decision_rule.current_field])}); derived ${outcome}.`;
@@ -94,7 +107,7 @@ export function deriveDeterministicOutcome(spec: ResolutionSpec, observationPayl
   return derivedOutcome;
 }
 
-export async function collectObservationFromSource(spec: ResolutionSpec): Promise<RuntimeCollectedObservation> {
+export async function fetchSourceDocument(spec: ResolutionSpec): Promise<RuntimeFetchedSourceDocument> {
   if (spec.source.adapter !== "http_json") {
     throw new ResolutionRuntimeError("unsupported_source_adapter");
   }
@@ -106,7 +119,7 @@ export async function collectObservationFromSource(spec: ResolutionSpec): Promis
   const response = await fetch(spec.source.canonical_url, {
     method: spec.source.method ?? "GET",
     headers: {
-      accept: "application/json",
+      accept: spec.source.extraction_mode === "agent_extract" ? "*/*" : "application/json",
       ...(spec.source.headers ?? {}),
     },
   });
@@ -115,11 +128,26 @@ export async function collectObservationFromSource(spec: ResolutionSpec): Promis
   }
 
   const rawBody = await response.text();
-  const sourceHash = sha256Hex(rawBody);
+  return {
+    source_url: spec.source.canonical_url,
+    source_hash: sha256Hex(rawBody),
+    source_adapter: spec.source.adapter,
+    fetched_at: new Date().toISOString(),
+    content_type: response.headers.get("content-type"),
+    raw_body: rawBody,
+  };
+}
+
+export async function collectObservationFromSource(spec: ResolutionSpec): Promise<RuntimeCollectedObservation> {
+  if (spec.source.extraction_mode === "agent_extract") {
+    throw new ResolutionRuntimeError("agent_extraction_required");
+  }
+
+  const document = await fetchSourceDocument(spec);
 
   let parsed: unknown;
   try {
-    parsed = JSON.parse(rawBody);
+    parsed = JSON.parse(document.raw_body);
   } catch {
     throw new ResolutionRuntimeError("source_payload_not_json");
   }
@@ -134,9 +162,9 @@ export async function collectObservationFromSource(spec: ResolutionSpec): Promis
   const derivedOutcome = deriveDeterministicOutcome(spec, observationPayload);
 
   return {
-    source_url: spec.source.canonical_url,
-    source_hash: sourceHash,
-    source_adapter: spec.source.adapter,
+    source_url: document.source_url,
+    source_hash: document.source_hash,
+    source_adapter: document.source_adapter,
     parser_version: "resolution-runtime@1",
     observed_at: observedAt,
     observation_payload: observationPayload,

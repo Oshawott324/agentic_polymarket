@@ -243,6 +243,7 @@ export async function ensureCoreSchema(pool: Pool) {
       id TEXT PRIMARY KEY,
       run_type TEXT NOT NULL,
       trigger_signal_ids JSONB NOT NULL,
+      trigger_event_case_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
       trigger_dedupe_key TEXT NOT NULL UNIQUE,
       status TEXT NOT NULL,
       started_at TIMESTAMPTZ NOT NULL,
@@ -600,6 +601,7 @@ export async function ensureCoreSchema(pool: Pool) {
     ALTER TABLE observations ADD COLUMN IF NOT EXISTS parser_version TEXT NOT NULL DEFAULT 'resolution-runtime@1';
     ALTER TABLE simulation_runs ADD COLUMN IF NOT EXISTS trigger_dedupe_key TEXT;
     ALTER TABLE simulation_runs ADD COLUMN IF NOT EXISTS last_updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+    ALTER TABLE simulation_runs ADD COLUMN IF NOT EXISTS trigger_event_case_ids JSONB NOT NULL DEFAULT '[]'::jsonb;
     ALTER TABLE scenario_path_proposals ADD COLUMN IF NOT EXISTS path_hypotheses JSONB NOT NULL DEFAULT '[]'::jsonb;
     ALTER TABLE synthesized_beliefs ADD COLUMN IF NOT EXISTS belief_dedupe_key TEXT;
     `);

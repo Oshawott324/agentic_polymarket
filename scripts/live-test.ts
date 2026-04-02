@@ -57,20 +57,6 @@ async function waitForJson(url: string, attempts = 50) {
   throw new Error(`Timed out waiting for ${url}`);
 }
 
-async function postJson(url: string, body: unknown) {
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
-  if (!response.ok) {
-    throw new Error(`Request failed ${response.status} ${url}: ${await response.text()}`);
-  }
-  return response.json();
-}
-
 async function waitForText(url: string, expected: string, attempts = 50) {
   for (let index = 0; index < attempts; index += 1) {
     try {
@@ -190,29 +176,84 @@ async function main() {
   const databaseDirectory = await mkdtemp(path.join(os.tmpdir(), "automakit-live-test-"));
   const databaseUrl = `postgres://postgres:postgres@127.0.0.1:${databasePort}/postgres`;
   const repoRoot = process.cwd();
-  const dbPool = new Pool({ connectionString: databaseUrl, max: 1 });
-  dbPool.on("error", () => undefined);
   const nextBin = path.join(repoRoot, "node_modules", ".pnpm", "node_modules", ".bin", "next");
   const pgliteServerBin = path.join(repoRoot, "node_modules", ".bin", "pglite-server");
   const resolvedCloseTime = new Date(Date.now() - 60_000).toISOString();
+  const bootstrapSources = [
+    {
+      key: "btc-price",
+      adapter: "http_json_price",
+      url: `http://127.0.0.1:${feedPort}/world-input/price`,
+      poll_interval_seconds: 1,
+      backfill_hours: 24,
+      trust_tier: "exchange",
+      asset_symbol: "BTC",
+      price_path: "price",
+      observed_at_path: "observed_at",
+      category: "crypto",
+    },
+    {
+      key: "fed-calendar",
+      adapter: "http_json_calendar",
+      url: `http://127.0.0.1:${feedPort}/world-input/fed-calendar`,
+      poll_interval_seconds: 1,
+      backfill_hours: 24,
+      trust_tier: "official",
+      category: "macro",
+    },
+    {
+      key: "x-recent-macro",
+      adapter: "x_api_recent_search",
+      url: `http://127.0.0.1:${feedPort}/world-input/x`,
+      poll_interval_seconds: 1,
+      trust_tier: "curated",
+      query: "macro OR fed OR inflation",
+    },
+    {
+      key: "reddit-worldnews",
+      adapter: "reddit_api_subreddit_new",
+      url: `http://127.0.0.1:${feedPort}/world-input/reddit-worldnews`,
+      poll_interval_seconds: 1,
+      trust_tier: "curated",
+      subreddit: "worldnews",
+      limit: 20,
+    },
+    {
+      key: "reddit-sports",
+      adapter: "reddit_api_subreddit_new",
+      url: `http://127.0.0.1:${feedPort}/world-input/reddit-sports`,
+      poll_interval_seconds: 1,
+      trust_tier: "curated",
+      subreddit: "sports",
+      limit: 20,
+    },
+    {
+      key: "rss-world",
+      adapter: "news_rss",
+      url: `http://127.0.0.1:${feedPort}/world-input/rss-world`,
+      poll_interval_seconds: 1,
+      trust_tier: "curated",
+    },
+    {
+      key: "rss-sports",
+      adapter: "news_rss",
+      url: `http://127.0.0.1:${feedPort}/world-input/rss-sports`,
+      poll_interval_seconds: 1,
+      trust_tier: "curated",
+    },
+    {
+      key: "official-alert",
+      adapter: "http_json_official_announcement",
+      url: `http://127.0.0.1:${feedPort}/world-input/official-announcement`,
+      poll_interval_seconds: 1,
+      backfill_hours: 24,
+      trust_tier: "official",
+      category: "world",
+    },
+  ];
   const worldInputPricePayload = {
-    items: [
-      {
-        source_id: "btc-threshold-jun-2026",
-        title: "BTC threshold candidate",
-        summary: "BTC threshold world signal",
-        effective_at: resolvedCloseTime,
-        payload: {
-          kind: "price_threshold",
-          asset_symbol: "BTC",
-          threshold: 100000,
-          operator: "gt",
-          target_time: resolvedCloseTime,
-          canonical_source_url: `http://127.0.0.1:${feedPort}/sources/btc`,
-          category: "crypto",
-        },
-      },
-    ],
+    price: 100500,
+    observed_at: resolvedCloseTime,
   };
   const worldInputFedPayload = {
     items: [
@@ -227,6 +268,7 @@ async function main() {
           direction: "cut",
           target_time: resolvedCloseTime,
           canonical_source_url: `http://127.0.0.1:${feedPort}/sources/fed`,
+          resolution_extraction_mode: "agent_extract",
           category: "macro",
         },
       },
@@ -262,6 +304,38 @@ async function main() {
       ],
     },
   };
+  const worldInputRedditWorldnewsPayload = {
+    data: {
+      children: [
+        {
+          data: {
+            id: "reddit-worldnews-1",
+            subreddit: "worldnews",
+            title: "Ceasefire talks resume after overnight strikes",
+            selftext: "Diplomatic teams are discussing a temporary humanitarian corridor.",
+            created_utc: Math.floor(new Date(resolvedCloseTime).getTime() / 1000),
+            permalink: "/r/worldnews/comments/reddit-worldnews-1/ceasefire_talks_resume",
+          },
+        },
+      ],
+    },
+  };
+  const worldInputRedditSportsPayload = {
+    data: {
+      children: [
+        {
+          data: {
+            id: "reddit-sports-1",
+            subreddit: "sports",
+            title: "Star striker expected back before weekend final",
+            selftext: "Training photos suggest the player may return to the squad.",
+            created_utc: Math.floor(new Date(resolvedCloseTime).getTime() / 1000),
+            permalink: "/r/sports/comments/reddit-sports-1/star_striker_expected_back",
+          },
+        },
+      ],
+    },
+  };
   const worldInputRssPayload = `<?xml version="1.0"?>
 <rss version="2.0">
   <channel>
@@ -275,6 +349,48 @@ async function main() {
     </item>
   </channel>
 </rss>`;
+  const worldInputWorldRssPayload = `<?xml version="1.0"?>
+<rss version="2.0">
+  <channel>
+    <title>Automakit World News</title>
+    <item>
+      <guid>rss-world-1</guid>
+      <title>Regional ceasefire proposal moves to emergency vote</title>
+      <link>https://news.example/world/rss-world-1</link>
+      <description>Officials are preparing an emergency vote after a night of cross-border attacks.</description>
+      <pubDate>${new Date(resolvedCloseTime).toUTCString()}</pubDate>
+    </item>
+  </channel>
+</rss>`;
+  const worldInputSportsRssPayload = `<?xml version="1.0"?>
+<rss version="2.0">
+  <channel>
+    <title>Automakit Sports</title>
+    <item>
+      <guid>rss-sports-1</guid>
+      <title>Championship match enters weather watch</title>
+      <link>https://news.example/sports/rss-sports-1</link>
+      <description>Forecasts show severe weather risk ahead of the scheduled kickoff.</description>
+      <pubDate>${new Date(resolvedCloseTime).toUTCString()}</pubDate>
+    </item>
+  </channel>
+</rss>`;
+  const worldInputOfficialAnnouncementPayload = {
+    items: [
+      {
+        source_id: "official-alert-1",
+        title: "Emergency summit scheduled for Friday",
+        summary: "Foreign ministry confirmed an emergency summit will be held on Friday.",
+        effective_at: resolvedCloseTime,
+        payload: {
+          institution: "Foreign Ministry",
+          event_name: "Emergency summit",
+          category: "world",
+          announcement_confirmed: true,
+        },
+      },
+    ],
+  };
 
   let fedObservationCount = 0;
   function toJsonCompletion(content: unknown) {
@@ -312,6 +428,19 @@ async function main() {
     return typeof value === "number" && Number.isFinite(value) ? value : fallback;
   }
 
+  async function queryDatabase<T extends Record<string, unknown> = Record<string, unknown>>(
+    sql: string,
+    params: unknown[] = [],
+  ) {
+    const pool = new Pool({ connectionString: databaseUrl, max: 1 });
+    pool.on("error", () => undefined);
+    try {
+      return await pool.query<T>(sql, params);
+    } finally {
+      await pool.end().catch(() => undefined);
+    }
+  }
+
   function handleWorldModelMock(payload: Record<string, unknown>) {
     const userMessage = Array.isArray(payload.messages)
       ? ((payload.messages as Array<Record<string, unknown>>).find(
@@ -333,20 +462,33 @@ async function main() {
         if (!signalId) {
           return null;
         }
-        if (payloadObject.kind === "price_threshold") {
+        if (
+          signal.source_type === "price_feed" ||
+          typeof payloadObject.price === "number" ||
+          typeof payloadObject.current_price === "number" ||
+          payloadObject.kind === "asset_price_observation"
+        ) {
+          const observedPrice = asNumber(payloadObject.price ?? payloadObject.current_price, 100500);
+          const threshold = Number((observedPrice * 0.995).toFixed(2));
           return {
             source_signal_id: signalId,
             hypothesis_kind: "price_threshold",
             category: typeof payloadObject.category === "string" ? payloadObject.category : "crypto",
             subject: typeof payloadObject.asset_symbol === "string" ? payloadObject.asset_symbol : "BTC",
-            predicate: "price_threshold",
+            predicate: `price >= ${threshold}`,
             target_time:
-              typeof payloadObject.target_time === "string"
-                ? payloadObject.target_time
-                : new Date().toISOString(),
+              typeof signal.effective_at === "string"
+                ? signal.effective_at
+                : typeof payloadObject.target_time === "string"
+                  ? payloadObject.target_time
+                  : new Date().toISOString(),
             confidence_score: 0.79,
-            reasoning_summary: "LLM world-model interpreted the threshold signal as bullish.",
+            reasoning_summary: "LLM world-model interpreted the price observation as a near-term threshold market.",
             machine_resolvable: true,
+            price_threshold: {
+              operator: "gt",
+              threshold,
+            },
           };
         }
         if (payloadObject.kind === "rate_decision") {
@@ -370,7 +512,29 @@ async function main() {
             machine_resolvable: true,
           };
         }
-        return null;
+        return {
+          source_signal_id: signalId,
+          hypothesis_kind: "event_occurrence",
+          category:
+            typeof payloadObject.category === "string"
+              ? payloadObject.category
+              : typeof signal.source_type === "string" && signal.source_type === "official_announcement"
+                ? "world"
+                : "news",
+          subject:
+            typeof payloadObject.event_name === "string"
+              ? payloadObject.event_name
+              : typeof signal.title === "string"
+                ? signal.title
+                : "World event",
+          predicate: `${typeof signal.title === "string" ? signal.title : "Event"} will occur by target date`,
+          target_time: new Date(Date.now() + 3 * 24 * 60 * 60_000).toISOString(),
+          confidence_score: 0.57,
+          reasoning_summary: "LLM world-model interpreted the incoming evidence as a forecast event candidate.",
+          machine_resolvable:
+            typeof payloadObject.observation_occurrence_path === "string" &&
+            typeof payloadObject.canonical_source_url === "string",
+        };
       })
       .filter((entry): entry is NonNullable<typeof entry> => Boolean(entry));
 
@@ -516,6 +680,71 @@ async function main() {
     };
   }
 
+  function readPathFromObject(root: unknown, pathExpression: string) {
+    const segments = pathExpression.split(".").filter(Boolean);
+    let current = root;
+    for (const segment of segments) {
+      if (!current || typeof current !== "object") {
+        return undefined;
+      }
+      current = (current as Record<string, unknown>)[segment];
+    }
+    return current;
+  }
+
+  function handleResolutionExtractionMock(payload: Record<string, unknown>) {
+    const userMessage = Array.isArray(payload.messages)
+      ? ((payload.messages as Array<Record<string, unknown>>).find(
+          (message) => message.role === "user",
+        ) as Record<string, unknown> | undefined)
+      : undefined;
+    const userContent =
+      userMessage && typeof userMessage.content === "string"
+        ? (JSON.parse(userMessage.content) as {
+            resolution_spec?: {
+              observation_schema?: {
+                fields?: Record<string, { path?: string; type?: string }>;
+              };
+            };
+            source_document?: { body?: string };
+          })
+        : {};
+    const fields = userContent.resolution_spec?.observation_schema?.fields ?? {};
+    const rawBody = typeof userContent.source_document?.body === "string" ? userContent.source_document.body : "";
+    let parsedDocument: unknown = rawBody;
+    try {
+      parsedDocument = JSON.parse(rawBody);
+    } catch {}
+
+    const observationPayload: Record<string, string | number | boolean | null> = {};
+    for (const [fieldName, fieldSpec] of Object.entries(fields)) {
+      const rawValue = typeof fieldSpec?.path === "string" ? readPathFromObject(parsedDocument, fieldSpec.path) : undefined;
+      if (fieldSpec?.type === "number") {
+        observationPayload[fieldName] = asNumber(rawValue);
+        continue;
+      }
+      if (fieldSpec?.type === "boolean") {
+        observationPayload[fieldName] =
+          typeof rawValue === "boolean"
+            ? rawValue
+            : rawValue === "true"
+              ? true
+              : rawValue === "false"
+                ? false
+                : null;
+        continue;
+      }
+      observationPayload[fieldName] = asString(rawValue);
+    }
+
+    return {
+      observation_payload: observationPayload,
+      observed_at:
+        typeof observationPayload.observed_at === "string" ? observationPayload.observed_at : new Date().toISOString(),
+      summary: "LLM extractor normalized the source document into a typed observation payload.",
+    };
+  }
+
   const feedServer = http.createServer(async (request, response) => {
     if (request.url === "/v1/chat/completions" && request.method === "POST") {
       const body = await readJsonRequestBody(request);
@@ -539,6 +768,11 @@ async function main() {
       if (systemPrompt.includes("synthesis agent for a prediction-market simulation fabric")) {
         response.writeHead(200, { "content-type": "application/json" });
         response.end(JSON.stringify(toJsonCompletion(handleSynthesisMock(body))));
+        return;
+      }
+      if (systemPrompt.includes("resolution extraction agent")) {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify(toJsonCompletion(handleResolutionExtractionMock(body))));
         return;
       }
 
@@ -566,14 +800,25 @@ async function main() {
     }
 
     if (request.url?.startsWith("/world-input/reddit")) {
+      const payload = request.url.includes("worldnews")
+        ? worldInputRedditWorldnewsPayload
+        : request.url.includes("sports")
+          ? worldInputRedditSportsPayload
+          : worldInputRedditPayload;
       response.writeHead(200, { "content-type": "application/json" });
-      response.end(JSON.stringify(worldInputRedditPayload));
+      response.end(JSON.stringify(payload));
       return;
     }
 
     if (request.url?.startsWith("/world-input/rss")) {
       response.writeHead(200, { "content-type": "application/rss+xml" });
-      response.end(worldInputRssPayload);
+      response.end(request.url.includes("sports") ? worldInputSportsRssPayload : request.url.includes("world") ? worldInputWorldRssPayload : worldInputRssPayload);
+      return;
+    }
+
+    if (request.url === "/world-input/official-announcement") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(worldInputOfficialAnnouncementPayload));
       return;
     }
 
@@ -605,6 +850,17 @@ async function main() {
                 observed_at: new Date().toISOString(),
               },
         ),
+      );
+      return;
+    }
+
+    if (request.url === "/sources/official-alert") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(
+        JSON.stringify({
+          announcement_confirmed: true,
+          observed_at: new Date().toISOString(),
+        }),
       );
       return;
     }
@@ -697,7 +953,7 @@ async function main() {
         ["dist/index.js"],
         {
           DATABASE_URL: databaseUrl,
-          WORLD_INPUT_BOOTSTRAP_SOURCES_JSON: "[]",
+          WORLD_INPUT_BOOTSTRAP_SOURCES_JSON: JSON.stringify(bootstrapSources),
           WORLD_INPUT_PORT: String(worldInputPort),
           WORLD_INPUT_INTERVAL_MS: "250",
         },
@@ -899,20 +1155,6 @@ async function main() {
       ),
     );
     processes.push(
-      startProcess(
-        "proposal-agent",
-        process.execPath,
-        ["dist/index.js"],
-        {
-          DATABASE_URL: databaseUrl,
-          PROPOSAL_PIPELINE_URL: "http://127.0.0.1:4005",
-          PROPOSAL_AGENT_PORT: String(proposalAgentPort),
-          PROPOSAL_AGENT_INTERVAL_MS: "250",
-        },
-        path.join(repoRoot, "services", "proposal-agent"),
-      ),
-    );
-    processes.push(
         startProcess(
           "resolution-collector-alpha",
           process.execPath,
@@ -924,6 +1166,7 @@ async function main() {
             COLLECTOR_AGENT_ID: "resolver-alpha",
             RESOLUTION_COLLECTOR_PORT: String(collectorAlphaPort),
             RESOLUTION_COLLECTOR_INTERVAL_MS: "500",
+            ...llmEnv,
           },
           path.join(repoRoot, "services", "resolution-collector"),
         ),
@@ -940,6 +1183,7 @@ async function main() {
           COLLECTOR_AGENT_ID: "resolver-beta",
           RESOLUTION_COLLECTOR_PORT: String(collectorBetaPort),
           RESOLUTION_COLLECTOR_INTERVAL_MS: "500",
+          ...llmEnv,
         },
         path.join(repoRoot, "services", "resolution-collector"),
       ),
@@ -988,49 +1232,9 @@ async function main() {
     await waitForText("http://127.0.0.1:3000", "Markets");
     await waitForText("http://127.0.0.1:3001/proposals", "Proposal Queue");
 
-    await postJson(`http://127.0.0.1:${worldInputPort}/v1/internal/world-input/sources`, {
-      key: "btc-price",
-      adapter: "http_json_price",
-      url: `http://127.0.0.1:${feedPort}/world-input/price`,
-      poll_interval_seconds: 1,
-      backfill_hours: 24,
-      trust_tier: "exchange",
-    });
-    await postJson(`http://127.0.0.1:${worldInputPort}/v1/internal/world-input/sources`, {
-      key: "fed-calendar",
-      adapter: "http_json_calendar",
-      url: `http://127.0.0.1:${feedPort}/world-input/fed-calendar`,
-      poll_interval_seconds: 1,
-      backfill_hours: 24,
-      trust_tier: "official",
-    });
-    await postJson(`http://127.0.0.1:${worldInputPort}/v1/internal/world-input/sources`, {
-      key: "x-recent",
-      adapter: "x_api_recent_search",
-      url: `http://127.0.0.1:${feedPort}/world-input/x`,
-      poll_interval_seconds: 1,
-      trust_tier: "curated",
-      query: "btc OR fed",
-    });
-    await postJson(`http://127.0.0.1:${worldInputPort}/v1/internal/world-input/sources`, {
-      key: "reddit-economy",
-      adapter: "reddit_api_subreddit_new",
-      url: `http://127.0.0.1:${feedPort}/world-input/reddit`,
-      poll_interval_seconds: 1,
-      trust_tier: "curated",
-      subreddit: "economy",
-    });
-    await postJson(`http://127.0.0.1:${worldInputPort}/v1/internal/world-input/sources`, {
-      key: "news-rss",
-      adapter: "news_rss",
-      url: `http://127.0.0.1:${feedPort}/world-input/rss`,
-      poll_interval_seconds: 1,
-      trust_tier: "curated",
-    });
-
-    await waitForCondition("registered world-input sources", async () => {
+    await waitForCondition("reconciled bootstrap world-input sources", async () => {
       const sources = (await waitForJson(
-        `http://127.0.0.1:${worldInputPort}/v1/internal/world-input/sources?limit=20`,
+        `http://127.0.0.1:${worldInputPort}/v1/internal/world-input/sources?limit=30`,
       )) as {
         items: Array<{ key: string; adapter: string }>;
       };
@@ -1038,24 +1242,28 @@ async function main() {
       return (
         keys.has("btc-price") &&
         keys.has("fed-calendar") &&
-        keys.has("x-recent") &&
-        keys.has("reddit-economy") &&
-        keys.has("news-rss")
+        keys.has("x-recent-macro") &&
+        keys.has("reddit-worldnews") &&
+        keys.has("reddit-sports") &&
+        keys.has("rss-world") &&
+        keys.has("rss-sports") &&
+        keys.has("official-alert")
       );
     });
 
     await waitForCondition("world signals", async () => {
       const signals = (await waitForJson(`http://127.0.0.1:${worldInputPort}/v1/internal/world-signals`)) as {
-        items: Array<{ source_id: string; source_adapter: string }>;
+        items: Array<{ source_id: string; source_adapter: string; title: string }>;
       };
       const adapters = new Set(signals.items.map((entry) => entry.source_adapter));
       return (
-        signals.items.length >= 5 &&
+        signals.items.length >= 8 &&
         adapters.has("http_json_price") &&
         adapters.has("http_json_calendar") &&
         adapters.has("x_api_recent_search") &&
         adapters.has("reddit_api_subreddit_new") &&
-        adapters.has("news_rss")
+        adapters.has("news_rss") &&
+        adapters.has("http_json_official_announcement")
       );
     });
 
@@ -1100,7 +1308,7 @@ async function main() {
     });
 
     const liveRun = (
-      await dbPool.query<{ id: string }>(
+      await queryDatabase<{ id: string }>(
         `
           SELECT id
           FROM simulation_runs
@@ -1115,7 +1323,7 @@ async function main() {
 
     const invalidApprovalBeliefId = "approval-invalid-belief-live-test";
     const invalidApprovalBeliefTitle = "Approval parity invalid belief";
-    await dbPool.query(
+    await queryDatabase(
       `
         INSERT INTO synthesized_beliefs (
           id,
@@ -1236,6 +1444,13 @@ async function main() {
       throw new Error(`Expected BTC and Fed markets, received ${JSON.stringify(markets.items)}`);
     }
 
+    const btcProposal = proposals.items.find((proposal) => proposal.title.includes("BTC trade above"));
+    const fedProposal = proposals.items.find((proposal) => proposal.title.includes("Federal Reserve cut rates"));
+
+    if (!btcProposal || !fedProposal) {
+      throw new Error(`Unexpected proposal set: ${JSON.stringify(proposals.items)}`);
+    }
+
     const proposalTitles = proposals.items.map((proposal) => proposal.title).sort();
     if (
       proposalTitles.length < 2 ||
@@ -1245,8 +1460,8 @@ async function main() {
       throw new Error(`Unexpected proposal set: ${JSON.stringify(proposals.items)}`);
     }
 
-    await waitForText("http://127.0.0.1:3000", "Will BTC trade above $100,000");
-    await waitForText("http://127.0.0.1:3001/proposals", "Will Federal Reserve cut rates");
+    await waitForText("http://127.0.0.1:3000", btcMarket.title);
+    await waitForText("http://127.0.0.1:3001/proposals", fedProposal.title);
 
     await waitForCondition("autonomous resolutions", async () => {
       const resolutions = (await waitForJson("http://127.0.0.1:4006/v1/resolutions")) as {
@@ -1376,8 +1591,8 @@ async function main() {
       throw new Error(`Quarantined resolution was not persisted: ${JSON.stringify(persistedResolutions.items)}`);
     }
 
-    await waitForText("http://127.0.0.1:3000", "Will BTC trade above $100,000");
-    await waitForText("http://127.0.0.1:3001/proposals", "Will Federal Reserve cut rates");
+    await waitForText("http://127.0.0.1:3000", btcMarket.title);
+    await waitForText("http://127.0.0.1:3001/proposals", fedProposal.title);
 
     console.log("live-test ok");
   } finally {
@@ -1394,7 +1609,6 @@ async function main() {
         resolve();
       });
     });
-    await dbPool.end().catch(() => undefined);
     await rm(databaseDirectory, { recursive: true, force: true });
   }
 }

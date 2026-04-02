@@ -8,18 +8,21 @@ import {
 } from "@automakit/persistence";
 import {
   SIM_RUNTIME_CONTRACT_VERSION_V1,
+  type SimulationEventCaseV1,
   type SimulationRunRequestV1,
   validateSimulationRunRequestV1,
 } from "@automakit/sim-runtime-contracts";
 import {
   buildDedupeKey,
   type BeliefHypothesisProposal,
+  type EventCase,
   type ScenarioPathProposal,
   type SimulationRunStatus,
   type SynthesizedBelief,
   type WorldSignal,
   type WorldStateProposal,
   validateBeliefHypothesisProposal,
+  validateEventCase,
   validateScenarioPathProposal,
   validateSynthesizedBelief,
   validateWorldStateProposal,
@@ -56,6 +59,7 @@ type SimulationRunRow = {
   id: string;
   run_type: string;
   trigger_signal_ids: unknown;
+  trigger_event_case_ids: unknown;
   trigger_dedupe_key: string;
   status: SimulationRunStatus;
   started_at: unknown;
@@ -75,6 +79,35 @@ type SimulationRuntimeRunRow = {
   created_at: unknown;
   updated_at: unknown;
   completed_at: unknown;
+};
+
+type EventCaseSummaryRow = {
+  id: string;
+  fingerprint: string;
+  last_signal_at: unknown;
+  signal_count: unknown;
+};
+
+type EventCaseRow = {
+  id: string;
+  fingerprint: string;
+  kind: string;
+  title: string;
+  summary: string;
+  primary_entity: string;
+  source_types: unknown;
+  source_adapters: unknown;
+  signal_count: unknown;
+  first_signal_at: unknown;
+  last_signal_at: unknown;
+  status: EventCase["status"];
+  created_at: unknown;
+  updated_at: unknown;
+};
+
+type EventCaseSignalLinkRow = {
+  event_case_id: string;
+  signal_id: string;
 };
 
 const port = Number(process.env.SIMULATION_ORCHESTRATOR_PORT ?? 4013);
@@ -123,12 +156,32 @@ function mapRunRow(row: SimulationRunRow) {
     id: row.id,
     run_type: row.run_type,
     trigger_signal_ids: parseJsonField<string[]>(row.trigger_signal_ids),
+    trigger_event_case_ids: parseJsonField<string[]>(row.trigger_event_case_ids),
     trigger_dedupe_key: row.trigger_dedupe_key,
     status: row.status,
     started_at: toIsoTimestamp(row.started_at),
     completed_at: row.completed_at ? toIsoTimestamp(row.completed_at) : null,
     failure_reason: row.failure_reason,
     last_updated_at: toIsoTimestamp(row.last_updated_at),
+  };
+}
+
+function mapEventCaseRow(row: EventCaseRow): EventCase {
+  return {
+    id: row.id,
+    fingerprint: row.fingerprint,
+    kind: row.kind,
+    title: row.title,
+    summary: row.summary,
+    primary_entity: row.primary_entity,
+    source_types: parseJsonField<EventCase["source_types"]>(row.source_types),
+    source_adapters: parseJsonField<EventCase["source_adapters"]>(row.source_adapters),
+    signal_count: Number(row.signal_count),
+    first_signal_at: toIsoTimestamp(row.first_signal_at),
+    last_signal_at: toIsoTimestamp(row.last_signal_at),
+    status: row.status,
+    created_at: toIsoTimestamp(row.created_at),
+    updated_at: toIsoTimestamp(row.updated_at),
   };
 }
 
@@ -184,6 +237,36 @@ async function fetchLatestSignals(limit: number) {
   return result.rows.reverse();
 }
 
+async function fetchLatestEventCases(limit: number) {
+  const result = await pool.query<EventCaseSummaryRow>(
+    `
+      SELECT
+        cases.id,
+        cases.fingerprint,
+        cases.last_signal_at,
+        cases.signal_count
+      FROM event_cases cases
+      WHERE cases.status IN ('open', 'stale')
+        AND EXISTS (
+          SELECT 1
+          FROM event_case_signals links
+          INNER JOIN world_signals signals
+            ON signals.id = links.signal_id
+          WHERE links.event_case_id = cases.id
+            AND NOT (
+              signals.source_type = 'price_feed'
+              AND COALESCE(signals.payload->>'kind', '') = 'price_threshold'
+            )
+        )
+      ORDER BY cases.last_signal_at DESC, cases.id DESC
+      LIMIT $1
+    `,
+    [limit],
+  );
+
+  return result.rows.reverse();
+}
+
 async function fetchSignalsByIds(signalIds: string[]) {
   if (signalIds.length === 0) {
     return [];
@@ -206,14 +289,78 @@ async function fetchSignalsByIds(signalIds: string[]) {
   return result.rows.map(mapSignalRow);
 }
 
+async function fetchEventCasesByIds(eventCaseIds: string[]): Promise<SimulationEventCaseV1[]> {
+  if (eventCaseIds.length === 0) {
+    return [];
+  }
+
+  const [eventCaseResult, linksResult] = await Promise.all([
+    pool.query<EventCaseRow>(
+      `
+        SELECT *
+        FROM event_cases
+        WHERE id = ANY($1::text[])
+        ORDER BY last_signal_at ASC, id ASC
+      `,
+      [eventCaseIds],
+    ),
+    pool.query<EventCaseSignalLinkRow>(
+      `
+        SELECT links.event_case_id, links.signal_id
+        FROM event_case_signals links
+        INNER JOIN world_signals signals
+          ON signals.id = links.signal_id
+        WHERE links.event_case_id = ANY($1::text[])
+          AND NOT (
+            signals.source_type = 'price_feed'
+            AND COALESCE(signals.payload->>'kind', '') = 'price_threshold'
+          )
+        ORDER BY links.event_case_id ASC, links.added_at ASC, links.signal_id ASC
+      `,
+      [eventCaseIds],
+    ),
+  ]);
+
+  const signalIdsByCase = new Map<string, string[]>();
+  for (const row of linksResult.rows) {
+    const existing = signalIdsByCase.get(row.event_case_id) ?? [];
+    existing.push(row.signal_id);
+    signalIdsByCase.set(row.event_case_id, existing);
+  }
+
+  return eventCaseResult.rows
+    .map((row) => {
+      const eventCase = mapEventCaseRow(row);
+      const validation = validateEventCase(eventCase);
+      if (!validation.ok) {
+        return null;
+      }
+      return {
+        ...validation.eventCase,
+        source_signal_ids: signalIdsByCase.get(eventCase.id) ?? [],
+      } satisfies SimulationEventCaseV1;
+    })
+    .filter((value): value is SimulationEventCaseV1 => value !== null);
+}
+
 async function ensureCurrentRun() {
-  const signals = await fetchLatestSignals(signalWindow);
+  const eventCaseSummaries = await fetchLatestEventCases(signalWindow);
+  const triggerEventCaseIds = eventCaseSummaries.map((eventCase) => eventCase.id);
+  const eventCases = await fetchEventCasesByIds(triggerEventCaseIds);
+
+  const linkedSignalIds = [...new Set(eventCases.flatMap((eventCase) => eventCase.source_signal_ids))];
+  const signals = linkedSignalIds.length > 0 ? await fetchSignalsByIds(linkedSignalIds) : await fetchLatestSignals(signalWindow);
   if (signals.length === 0) {
     return null;
   }
 
   const triggerSignalIds = signals.map((signal) => signal.id);
   const triggerDedupeKey = buildDedupeKey({
+    trigger_event_cases: eventCaseSummaries.map((eventCase) => ({
+      fingerprint: eventCase.fingerprint,
+      last_signal_at: toIsoTimestamp(eventCase.last_signal_at),
+      signal_count: Number(eventCase.signal_count),
+    })),
     trigger_signal_ids: triggerSignalIds,
     signal_dedupe_keys: signals.map((signal) => signal.dedupe_key),
   });
@@ -240,15 +387,25 @@ async function ensureCurrentRun() {
         id,
         run_type,
         trigger_signal_ids,
+        trigger_event_case_ids,
         trigger_dedupe_key,
         status,
         started_at,
         last_updated_at
       )
-      VALUES ($1, $2, $3::jsonb, $4, $5, $6::timestamptz, $7::timestamptz)
+      VALUES ($1, $2, $3::jsonb, $4::jsonb, $5, $6, $7::timestamptz, $8::timestamptz)
       ON CONFLICT (trigger_dedupe_key) DO NOTHING
     `,
-    [runId, "belief_refresh", JSON.stringify(triggerSignalIds), triggerDedupeKey, "world_model_pending", now, now],
+    [
+      runId,
+      "belief_refresh",
+      JSON.stringify(triggerSignalIds),
+      JSON.stringify(triggerEventCaseIds),
+      triggerDedupeKey,
+      "world_model_pending",
+      now,
+      now,
+    ],
   );
 
   return runId;
@@ -416,13 +573,18 @@ async function fetchActiveRuntimeRuns(limit: number) {
   return result.rows.map(mapRuntimeRunRow);
 }
 
-function buildRuntimeRequest(run: ReturnType<typeof mapRunRow>, signals: WorldSignal[]): SimulationRunRequestV1 {
+function buildRuntimeRequest(
+  run: ReturnType<typeof mapRunRow>,
+  signals: WorldSignal[],
+  eventCases: SimulationEventCaseV1[],
+): SimulationRunRequestV1 {
   return {
     contract_version: runtimeContractVersion,
     run_id: run.id,
     trace_id: `${simulationTracePrefix}-${run.id}`,
     submitted_at: new Date().toISOString(),
     signals,
+    event_cases: eventCases,
     agent_roles: {
       world_model: runtimeRolesWorldModel,
       scenario: runtimeRolesScenario,
@@ -655,6 +817,7 @@ async function dispatchRuntimeRuns() {
   const runs = await fetchRunsPendingRuntimeDispatch(10);
   for (const run of runs) {
     const signals = await fetchSignalsByIds(run.trigger_signal_ids);
+    const eventCases = await fetchEventCasesByIds(run.trigger_event_case_ids);
     if (signals.length === 0) {
       await pool.query(
         `
@@ -667,7 +830,7 @@ async function dispatchRuntimeRuns() {
       continue;
     }
 
-    const request = buildRuntimeRequest(run, signals);
+    const request = buildRuntimeRequest(run, signals, eventCases);
     const validation = validateSimulationRunRequestV1(request);
     if (!validation.ok) {
       await pool.query(

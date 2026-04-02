@@ -152,6 +152,33 @@ function buildRateDecisionCandidate(belief: SynthesizedBelief, resolutionSpec: R
   };
 }
 
+function buildEventOccurrenceCandidate(belief: SynthesizedBelief, resolutionSpec: ResolutionSpec): ProposalCandidate {
+  if (resolutionSpec.kind !== "event_occurrence") {
+    throw new Error("belief_resolution_kind_mismatch");
+  }
+
+  const dateLabel = formatDateLabel(belief.hypothesis.target_time);
+  const subject = belief.hypothesis.subject;
+  const predicate = belief.hypothesis.predicate.replace(/\s+by target date$/i, "").trim();
+  const readablePredicate = predicate.length > 0 ? predicate : `${subject} will occur`;
+
+  return {
+    title: `Will ${subject} occur by ${dateLabel}?`,
+    category: belief.hypothesis.category,
+    close_time: belief.hypothesis.target_time,
+    resolution_criteria: `Resolve YES if ${readablePredicate} by ${dateLabel} using ${resolutionSpec.source.canonical_url}.`,
+    resolution_spec: {
+      ...resolutionSpec,
+      source: {
+        ...resolutionSpec.source,
+        allowed_domains: normalizeAllowedDomainsFromUrl(resolutionSpec.source.canonical_url),
+      },
+    },
+    dedupe_key: belief.hypothesis.dedupe_key,
+    source_belief_id: belief.id,
+  };
+}
+
 function buildProposalCandidate(belief: SynthesizedBelief) {
   const resolutionSpec = belief.hypothesis.suggested_resolution_spec;
   if (!belief.hypothesis.machine_resolvable || !resolutionSpec) {
@@ -163,6 +190,8 @@ function buildProposalCandidate(belief: SynthesizedBelief) {
       return buildPriceThresholdCandidate(belief, resolutionSpec);
     case "rate_decision":
       return buildRateDecisionCandidate(belief, resolutionSpec);
+    case "event_occurrence":
+      return buildEventOccurrenceCandidate(belief, resolutionSpec);
     default:
       throw new Error("belief_resolution_kind_unsupported");
   }

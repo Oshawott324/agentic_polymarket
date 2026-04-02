@@ -27,6 +27,24 @@ class WorldSignal(BaseModel):
     created_at: str
 
 
+class EventCase(BaseModel):
+    id: str
+    fingerprint: str
+    kind: str
+    title: str
+    summary: str
+    primary_entity: str
+    source_types: List[str]
+    source_adapters: List[str]
+    signal_count: int
+    first_signal_at: str
+    last_signal_at: str
+    status: str
+    created_at: str
+    updated_at: str
+    source_signal_ids: List[str]
+
+
 class SimulationAgentRoles(BaseModel):
     world_model: List[str] = Field(default_factory=list)
     scenario: List[str] = Field(default_factory=list)
@@ -45,6 +63,7 @@ class SimulationRunRequestV1(BaseModel):
     trace_id: str
     submitted_at: str
     signals: List[WorldSignal]
+    event_cases: List[EventCase] = Field(default_factory=list)
     agent_roles: SimulationAgentRoles
     timeouts: SimulationTimeouts
 

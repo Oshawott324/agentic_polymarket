@@ -59,6 +59,9 @@ const pool = createDatabasePool();
 const marketServiceUrl = process.env.MARKET_SERVICE_URL ?? "http://localhost:4003";
 const autoPublishThreshold = Math.max(0, Math.min(1, Number(process.env.PROPOSAL_AUTO_PUBLISH_THRESHOLD ?? 0.7)));
 const autoQueueThreshold = Math.max(0, Math.min(1, Number(process.env.PROPOSAL_AUTO_QUEUE_THRESHOLD ?? 0.45)));
+const semanticDuplicateWindowHours = Math.max(6, Number(process.env.PROPOSAL_SEMANTIC_DUP_WINDOW_HOURS ?? 72));
+const semanticPriceThresholdTolerance = Math.max(0.001, Number(process.env.PROPOSAL_SEMANTIC_PRICE_REL_TOLERANCE ?? 0.025));
+const semanticTitleSimilarityThreshold = Math.max(0.2, Math.min(1, Number(process.env.PROPOSAL_SEMANTIC_TITLE_SIMILARITY ?? 0.45)));
 
 function mapProposalRow(row: ProposalRow): Proposal {
   return {
@@ -96,6 +99,139 @@ async function getProposalByDedupeKey(dedupeKey: string) {
   );
 
   return result.rowCount ? mapProposalRow(result.rows[0]) : null;
+}
+
+function normalizeText(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function tokenize(value: string) {
+  const stop = new Set(["the", "a", "an", "will", "be", "by", "on", "of", "to", "for", "at"]);
+  return normalizeText(value)
+    .split(" ")
+    .map((token) => token.trim())
+    .filter((token) => token.length > 1 && !stop.has(token));
+}
+
+function jaccardSimilarity(left: string, right: string) {
+  const leftSet = new Set(tokenize(left));
+  const rightSet = new Set(tokenize(right));
+  if (leftSet.size === 0 || rightSet.size === 0) {
+    return 0;
+  }
+  let intersection = 0;
+  for (const token of leftSet) {
+    if (rightSet.has(token)) {
+      intersection += 1;
+    }
+  }
+  const union = new Set([...leftSet, ...rightSet]).size;
+  return union === 0 ? 0 : intersection / union;
+}
+
+function normalizeCanonicalUrl(raw: string) {
+  try {
+    const url = new URL(raw);
+    url.hash = "";
+    return `${url.protocol}//${url.host}${url.pathname}`;
+  } catch {
+    return raw.trim().toLowerCase();
+  }
+}
+
+function operatorDirection(operator: "gt" | "gte" | "lt" | "lte") {
+  return operator === "gt" || operator === "gte" ? "up" : "down";
+}
+
+function isCloseTimeNear(leftIso: string, rightIso: string, windowHours: number) {
+  const leftMs = new Date(leftIso).getTime();
+  const rightMs = new Date(rightIso).getTime();
+  if (!Number.isFinite(leftMs) || !Number.isFinite(rightMs)) {
+    return false;
+  }
+  return Math.abs(leftMs - rightMs) <= windowHours * 60 * 60 * 1000;
+}
+
+function isSemanticNearDuplicate(existing: Proposal, incoming: {
+  title: string;
+  category: string;
+  close_time: string;
+  resolution_spec: ResolutionSpec;
+}) {
+  if (existing.resolution_kind !== incoming.resolution_spec.kind) {
+    return false;
+  }
+  if (normalizeText(existing.category) !== normalizeText(incoming.category)) {
+    return false;
+  }
+
+  const titleSimilarity = jaccardSimilarity(existing.title, incoming.title);
+  const closeNear = isCloseTimeNear(existing.close_time, incoming.close_time, semanticDuplicateWindowHours);
+  if (!closeNear) {
+    return false;
+  }
+
+  if (incoming.resolution_spec.kind === "price_threshold" && existing.resolution_spec.kind === "price_threshold") {
+    const existingSource = normalizeCanonicalUrl(existing.resolution_spec.source.canonical_url);
+    const incomingSource = normalizeCanonicalUrl(incoming.resolution_spec.source.canonical_url);
+    if (existingSource !== incomingSource) {
+      return false;
+    }
+    if (operatorDirection(existing.resolution_spec.decision_rule.operator) !== operatorDirection(incoming.resolution_spec.decision_rule.operator)) {
+      return false;
+    }
+    const left = Number(existing.resolution_spec.decision_rule.threshold);
+    const right = Number(incoming.resolution_spec.decision_rule.threshold);
+    if (!Number.isFinite(left) || !Number.isFinite(right) || left <= 0 || right <= 0) {
+      return false;
+    }
+    const relativeDelta = Math.abs(left - right) / Math.max(left, right);
+    return relativeDelta <= semanticPriceThresholdTolerance;
+  }
+
+  if (incoming.resolution_spec.kind === "rate_decision" && existing.resolution_spec.kind === "rate_decision") {
+    const existingSource = normalizeCanonicalUrl(existing.resolution_spec.source.canonical_url);
+    const incomingSource = normalizeCanonicalUrl(incoming.resolution_spec.source.canonical_url);
+    return (
+      existingSource === incomingSource &&
+      existing.resolution_spec.decision_rule.direction === incoming.resolution_spec.decision_rule.direction
+    );
+  }
+
+  return titleSimilarity >= 0.9;
+}
+
+async function findSemanticDuplicate(incoming: {
+  title: string;
+  category: string;
+  close_time: string;
+  resolution_spec: ResolutionSpec;
+}) {
+  const result = await pool.query<ProposalRow>(
+    `
+      SELECT *
+      FROM proposals
+      WHERE
+        resolution_kind = $1
+        AND category = $2
+        AND close_time BETWEEN ($3::timestamptz - ($4 * INTERVAL '1 hour')) AND ($3::timestamptz + ($4 * INTERVAL '1 hour'))
+      ORDER BY created_at DESC, id DESC
+      LIMIT 200
+    `,
+    [incoming.resolution_spec.kind, incoming.category, incoming.close_time, semanticDuplicateWindowHours],
+  );
+
+  for (const row of result.rows) {
+    const proposal = mapProposalRow(row);
+    if (isSemanticNearDuplicate(proposal, incoming)) {
+      return proposal;
+    }
+  }
+  return null;
 }
 
 async function getProposalById(proposalId: string) {
@@ -325,6 +461,13 @@ app.post("/v1/market-proposals", async (request, reply) => {
   const dedupeKey =
     body.dedupe_key ??
     `${body.category ?? "uncategorized"}:${body.title ?? "Untitled proposal"}:${body.close_time ?? ""}`;
+  const normalizedTitle = body.title ?? "Untitled proposal";
+  const normalizedCategory = body.category ?? "uncategorized";
+  const normalizedCloseTime = body.close_time ?? new Date(Date.now() + 7 * 24 * 60 * 60_000).toISOString();
+  const resolutionSpecValidation = body.resolution_spec ? validateResolutionSpec(body.resolution_spec) : null;
+  const resolutionSpec =
+    resolutionSpecValidation && resolutionSpecValidation.ok ? resolutionSpecValidation.spec : null;
+
   const existing = await getProposalByDedupeKey(dedupeKey);
   if (existing) {
     existing.observation_count += 1;
@@ -336,17 +479,32 @@ app.post("/v1/market-proposals", async (request, reply) => {
     };
   }
 
+  if (resolutionSpec) {
+    const semanticDuplicate = await findSemanticDuplicate({
+      title: normalizedTitle,
+      category: normalizedCategory,
+      close_time: normalizedCloseTime,
+      resolution_spec: resolutionSpec,
+    });
+    if (semanticDuplicate) {
+      semanticDuplicate.observation_count += 1;
+      await maybePublishQueuedProposal(semanticDuplicate);
+      const savedProposal = await saveProposal(semanticDuplicate);
+      return {
+        ...savedProposal,
+        deduped: true,
+      };
+    }
+  }
+
   const decision = scoreProposal(body);
-  const resolutionSpecValidation = body.resolution_spec ? validateResolutionSpec(body.resolution_spec) : null;
-  const resolutionSpec =
-    resolutionSpecValidation && resolutionSpecValidation.ok ? resolutionSpecValidation.spec : null;
 
   const proposal: Proposal = {
     id: randomUUID(),
     proposer_agent_id: body.proposer_agent_id ?? "seed-agent",
-    title: body.title ?? "Untitled proposal",
-    category: body.category ?? "uncategorized",
-    close_time: body.close_time ?? new Date(Date.now() + 7 * 24 * 60 * 60_000).toISOString(),
+    title: normalizedTitle,
+    category: normalizedCategory,
+    close_time: normalizedCloseTime,
     resolution_criteria: body.resolution_criteria ?? "TBD",
     resolution_spec:
       resolutionSpec ??

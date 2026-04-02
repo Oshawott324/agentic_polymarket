@@ -1,8 +1,9 @@
-export type ResolutionKind = "price_threshold" | "rate_decision";
+export type ResolutionKind = "price_threshold" | "rate_decision" | "event_occurrence";
 export type ResolutionOutcome = "YES" | "NO" | "CANCELED";
 export type ResolutionAgreement = "all" | "majority" | "2_of_3";
 export type ObservationFieldType = "number" | "string" | "boolean";
 export type ResolutionSourceAdapter = "http_json";
+export type ResolutionExtractionMode = "deterministic_json" | "agent_extract";
 
 export type ObservationValue = string | number | boolean | null;
 export type ObservationPayload = Record<string, ObservationValue>;
@@ -11,6 +12,7 @@ export type ResolutionSourceSpec = {
   adapter: ResolutionSourceAdapter;
   canonical_url: string;
   allowed_domains: string[];
+  extraction_mode?: ResolutionExtractionMode;
   method?: "GET";
   headers?: Record<string, string>;
 };
@@ -40,7 +42,13 @@ export type RateDecisionRule = {
   direction: "cut" | "hold" | "hike";
 };
 
-export type DecisionRule = PriceThresholdDecisionRule | RateDecisionRule;
+export type EventOccurrenceDecisionRule = {
+  kind: "event_occurrence";
+  observation_field: string;
+  expected_value: boolean;
+};
+
+export type DecisionRule = PriceThresholdDecisionRule | RateDecisionRule | EventOccurrenceDecisionRule;
 
 export type QuorumRule = {
   min_observations: number;
@@ -69,6 +77,14 @@ export type ResolutionSpec =
       source: ResolutionSourceSpec;
       observation_schema: ObservationSchema;
       decision_rule: RateDecisionRule;
+      quorum_rule: QuorumRule;
+      quarantine_rule: QuarantineRule;
+    }
+  | {
+      kind: "event_occurrence";
+      source: ResolutionSourceSpec;
+      observation_schema: ObservationSchema;
+      decision_rule: EventOccurrenceDecisionRule;
       quorum_rule: QuorumRule;
       quarantine_rule: QuarantineRule;
     };
@@ -105,6 +121,13 @@ const resolutionRegistry: Record<ResolutionKind, ResolutionRegistryEntry> = {
     required_fields: {
       previous_upper_bound_bps: "number",
       current_upper_bound_bps: "number",
+    },
+  },
+  event_occurrence: {
+    kind: "event_occurrence",
+    allowed_domains: [],
+    required_fields: {
+      occurred: "boolean",
     },
   },
 };
@@ -176,6 +199,14 @@ export function deriveOutcomeFromResolutionSpec(
     }
   }
 
+  if (spec.kind === "event_occurrence") {
+    const observedValue = payload[spec.decision_rule.observation_field];
+    if (typeof observedValue !== "boolean") {
+      return null;
+    }
+    return observedValue === spec.decision_rule.expected_value ? "YES" : "NO";
+  }
+
   const previous = payload[spec.decision_rule.previous_field];
   const current = payload[spec.decision_rule.current_field];
   if (typeof previous !== "number" || typeof current !== "number") {
@@ -212,13 +243,20 @@ export function validateResolutionSpec(spec: unknown): ResolutionSpecValidationR
     if (candidate.source.adapter !== "http_json") {
       errors.push("unsupported_resolution_source_adapter");
     }
+    if (
+      candidate.source.extraction_mode !== undefined &&
+      candidate.source.extraction_mode !== "deterministic_json" &&
+      candidate.source.extraction_mode !== "agent_extract"
+    ) {
+      errors.push("unsupported_resolution_extraction_mode");
+    }
     if (!candidate.source.canonical_url) {
       errors.push("missing_canonical_url");
     } else {
       try {
         const canonicalHost = normalizeHost(candidate.source.canonical_url);
         const registryEntry = candidate.kind ? resolutionRegistry[candidate.kind] : null;
-        if (registryEntry) {
+        if (registryEntry && registryEntry.allowed_domains.length > 0) {
           const registryAllowed = registryEntry.allowed_domains.some((domain) =>
             hostMatchesAllowed(canonicalHost, domain),
           );
@@ -310,6 +348,15 @@ export function validateResolutionSpec(spec: unknown): ResolutionSpecValidationR
       if (current.type !== "number") {
         errors.push("rate_decision_current_field_must_be_number");
       }
+    }
+  }
+
+  if (typedSpec.kind === "event_occurrence") {
+    const field = typedSpec.observation_schema.fields[typedSpec.decision_rule.observation_field];
+    if (!field) {
+      errors.push("event_occurrence_observation_field_missing");
+    } else if (field.type !== "boolean") {
+      errors.push("event_occurrence_observation_field_must_be_boolean");
     }
   }
 

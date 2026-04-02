@@ -214,6 +214,9 @@ importers:
 
   services/resolution-collector:
     dependencies:
+      '@automakit/agent-llm':
+        specifier: workspace:*
+        version: link:../../packages/agent-llm
       '@automakit/persistence':
         specifier: workspace:*
         version: link:../../packages/persistence

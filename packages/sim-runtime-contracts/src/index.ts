@@ -1,10 +1,12 @@
 import {
   type BeliefHypothesisProposal,
+  type EventCase,
   type ScenarioPathProposal,
   type SynthesizedBelief,
   type WorldSignal,
   type WorldStateProposal,
   validateBeliefHypothesisProposal,
+  validateEventCase,
   validateScenarioPathProposal,
   validateSynthesizedBelief,
   validateWorldSignal,
@@ -27,12 +29,17 @@ export type SimulationRunTimeouts = {
   status_poll_interval_ms: number;
 };
 
+export type SimulationEventCaseV1 = EventCase & {
+  source_signal_ids: string[];
+};
+
 export type SimulationRunRequestV1 = {
   contract_version: SimulationContractVersion;
   run_id: string;
   trace_id: string;
   submitted_at: string;
   signals: WorldSignal[];
+  event_cases: SimulationEventCaseV1[];
   agent_roles: SimulationAgentRoles;
   timeouts: SimulationRunTimeouts;
 };
@@ -106,6 +113,28 @@ export function validateSimulationRunRequestV1(request: unknown) {
       const validation = validateWorldSignal(signal);
       if (!validation.ok) {
         errors.push(...validation.errors.map((entry: string) => `simulation_run_request_${entry}`));
+      }
+    }
+  }
+
+  if (!Array.isArray(candidate.event_cases)) {
+    errors.push("simulation_run_request_event_cases_required");
+  } else {
+    for (const eventCase of candidate.event_cases) {
+      const validation = validateEventCase(eventCase);
+      if (!validation.ok) {
+        errors.push(...validation.errors.map((entry: string) => `simulation_run_request_${entry}`));
+        continue;
+      }
+      if (!Array.isArray(eventCase.source_signal_ids)) {
+        errors.push("simulation_run_request_event_case_source_signal_ids_required");
+        continue;
+      }
+      for (const signalId of eventCase.source_signal_ids) {
+        if (typeof signalId !== "string" || !signalId) {
+          errors.push("simulation_run_request_event_case_source_signal_ids_invalid");
+          break;
+        }
       }
     }
   }

@@ -10,6 +10,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@automakit/agent-llm": "workspace:*",
     "@automakit/persistence": "workspace:*",
     "@automakit/resolution-runtime": "workspace:*",
     "@automakit/sdk-types": "workspace:*",

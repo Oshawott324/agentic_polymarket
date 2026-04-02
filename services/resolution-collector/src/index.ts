@@ -1,11 +1,16 @@
 import { randomUUID } from "node:crypto";
 import Fastify from "fastify";
+import { loadLlmClientFromEnv } from "@automakit/agent-llm";
 import { createDatabasePool, ensureCoreSchema, parseJsonField, toIsoTimestamp } from "@automakit/persistence";
 import {
   ResolutionRuntimeError,
   collectObservationFromSource,
+  deriveDeterministicOutcome,
+  fetchSourceDocument,
+  getObservedAtFromPayload,
+  summarizeObservation,
 } from "@automakit/resolution-runtime";
-import type { ResolutionSpec } from "@automakit/sdk-types";
+import { type ObservationPayload, type ResolutionSpec, validateObservationPayload } from "@automakit/sdk-types";
 
 type ResolutionCandidate = {
   market_id: string;
@@ -57,10 +62,18 @@ const batchSize = Number(process.env.RESOLUTION_COLLECTOR_BATCH_SIZE ?? 10);
 const claimTtlMs = Number(process.env.RESOLUTION_COLLECTOR_CLAIM_TTL_MS ?? 15000);
 const backoffBaseMs = Number(process.env.RESOLUTION_COLLECTOR_BACKOFF_BASE_MS ?? 1000);
 const backoffMaxMs = Number(process.env.RESOLUTION_COLLECTOR_BACKOFF_MAX_MS ?? 30000);
+const extractionDocumentCharLimit = Number(process.env.RESOLUTION_COLLECTOR_EXTRACTION_DOCUMENT_CHAR_LIMIT ?? 12_000);
 
 let tickInFlight = false;
 let lastTickAt: string | null = null;
 let lastTickError: string | null = null;
+let extractionLlmClient: ReturnType<typeof loadLlmClientFromEnv> | null | undefined;
+
+type ResolutionExtractionResponse = {
+  observation_payload?: ObservationPayload;
+  observed_at?: string | null;
+  summary?: string | null;
+};
 
 function mapJobRow(row: ResolutionCollectionJobRow): ResolutionCollectionJob {
   return {
@@ -75,6 +88,94 @@ function mapJobRow(row: ResolutionCollectionJobRow): ResolutionCollectionJob {
     last_error: row.last_error,
     created_at: toIsoTimestamp(row.created_at),
     updated_at: toIsoTimestamp(row.updated_at),
+  };
+}
+
+function getExtractionLlmClient() {
+  if (extractionLlmClient !== undefined) {
+    return extractionLlmClient;
+  }
+
+  try {
+    extractionLlmClient = loadLlmClientFromEnv();
+  } catch {
+    extractionLlmClient = null;
+  }
+
+  return extractionLlmClient;
+}
+
+function buildResolutionExtractionSystemPrompt() {
+  return [
+    "You are a resolution extraction agent.",
+    "Return strict JSON only.",
+    "Extract a structured observation_payload that matches the provided observation schema.",
+    "Do not decide YES or NO. Do not apply the market decision rule.",
+    "Use explicit values from the source document only.",
+    "When a required value is not present, set that field to null.",
+    "You may provide observed_at when the source includes a reliable timestamp.",
+    "Keep summary concise and factual.",
+  ].join(" ");
+}
+
+function normalizeObservedAt(value: unknown, fallbackPayload: ObservationPayload) {
+  if (typeof value === "string" && !Number.isNaN(Date.parse(value))) {
+    return new Date(value).toISOString();
+  }
+  return getObservedAtFromPayload(fallbackPayload);
+}
+
+async function collectObservationViaAgent(candidate: ResolutionCandidate) {
+  const llmClient = getExtractionLlmClient();
+  if (!llmClient) {
+    throw new ResolutionRuntimeError("agent_extraction_unavailable");
+  }
+
+  const document = await fetchSourceDocument(candidate.resolution_spec);
+  const response = await llmClient.chatJson<ResolutionExtractionResponse>([
+    { role: "system", content: buildResolutionExtractionSystemPrompt() },
+    {
+      role: "user",
+      content: JSON.stringify({
+        market_title: candidate.title,
+        resolution_spec: candidate.resolution_spec,
+        source_document: {
+          source_url: document.source_url,
+          content_type: document.content_type,
+          fetched_at: document.fetched_at,
+          body: document.raw_body.slice(0, extractionDocumentCharLimit),
+          truncated: document.raw_body.length > extractionDocumentCharLimit,
+        },
+      }),
+    },
+  ]);
+
+  if (!response || typeof response !== "object" || !response.observation_payload || typeof response.observation_payload !== "object") {
+    throw new ResolutionRuntimeError("source_payload_not_extractable", "agent_extraction_payload_missing");
+  }
+
+  const observationPayload = response.observation_payload;
+  const schemaErrors = validateObservationPayload(candidate.resolution_spec, observationPayload);
+  if (schemaErrors.length > 0) {
+    throw new ResolutionRuntimeError(
+      "observation_schema_validation_failed",
+      `observation_schema_validation_failed:${schemaErrors.join(",")}`,
+    );
+  }
+
+  const derivedOutcome = deriveDeterministicOutcome(candidate.resolution_spec, observationPayload);
+  return {
+    source_url: document.source_url,
+    source_hash: document.source_hash,
+    source_adapter: document.source_adapter,
+    parser_version: "agent-extractor@1",
+    observed_at: normalizeObservedAt(response.observed_at, observationPayload),
+    observation_payload: observationPayload,
+    derived_outcome: derivedOutcome,
+    summary:
+      typeof response.summary === "string" && response.summary.trim().length > 0
+        ? response.summary.trim().slice(0, 500)
+        : summarizeObservation(candidate.resolution_spec, observationPayload, derivedOutcome),
   };
 }
 
@@ -201,7 +302,10 @@ async function submitCollectedObservation(
   job: ResolutionCollectionJob,
   candidate: ResolutionCandidate,
 ) {
-  const collected = await collectObservationFromSource(candidate.resolution_spec);
+  const collected =
+    candidate.resolution_spec.source.extraction_mode === "agent_extract"
+      ? await collectObservationViaAgent(candidate)
+      : await collectObservationFromSource(candidate.resolution_spec);
   const response = await fetch(`${resolutionServiceUrl}/v1/internal/resolution-observations`, {
     method: "POST",
     headers: {
@@ -281,6 +385,12 @@ function classifyRuntimeFailure(error: unknown) {
       return {
         kind: "decision_rule" as const,
         retriable: false,
+        message: error.message,
+      };
+    case "agent_extraction_unavailable":
+      return {
+        kind: "unknown" as const,
+        retriable: true,
         message: error.message,
       };
     default:
