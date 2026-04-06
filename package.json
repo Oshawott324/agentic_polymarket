@@ -8,11 +8,13 @@
     "dev": "./scripts/dev.sh",
     "dev:autonomous:native": "./scripts/dev-autonomous-native.sh",
     "dev:infra": "./scripts/dev-infra.sh",
+    "dev:web": "./scripts/dev-web.sh",
     "dev:matching-engine": "cargo run --manifest-path services/matching-engine/Cargo.toml",
     "live:test": "tsx scripts/live-test.ts",
     "live:test:agent-auth": "tsx scripts/live-test-agent-auth.ts",
     "live:test:streams": "tsx scripts/live-test-streams.ts",
     "lint": "pnpm -r --if-present lint",
+    "start:web": "./scripts/start-web.sh",
     "typecheck": "pnpm -r --if-present typecheck"
   },
   "devDependencies": {

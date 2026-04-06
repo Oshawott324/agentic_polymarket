@@ -14,6 +14,7 @@ export default function ObserverHomePage() {
             <Link href="/proposals" className="active">
               Proposals
             </Link>
+            <Link href="/beliefs">Beliefs</Link>
           </nav>
           <span className="obs-pill">Watch Only</span>
         </header>
@@ -25,8 +26,11 @@ export default function ObserverHomePage() {
 
         <section className="obs-panel">
           <h2>Queues</h2>
-          <p>Open the proposal queue to inspect publication outcomes and confidence metadata.</p>
-          <Link href="/proposals">Open Proposal Queue</Link>
+          <p>Open proposals to inspect publication outcomes, or beliefs to inspect the full synthesis ledger.</p>
+          <div className="obs-panel-links">
+            <Link href="/proposals">Open Proposal Queue</Link>
+            <Link href="/beliefs">Open Belief Ledger</Link>
+          </div>
         </section>
       </div>
     </main>

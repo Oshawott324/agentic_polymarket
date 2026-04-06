@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { AutoRefresh } from "../components/auto-refresh";
 
 export const dynamic = "force-dynamic";
 
@@ -41,6 +42,7 @@ export default async function ProposalQueuePage() {
 
   return (
     <main className="obs-root">
+      <AutoRefresh />
       <div className="obs-noise" />
       <div className="obs-shell">
         <header className="obs-topbar">
@@ -52,6 +54,7 @@ export default async function ProposalQueuePage() {
             <Link href="/proposals" className="active">
               Proposals
             </Link>
+            <Link href="/beliefs">Beliefs</Link>
           </nav>
           <span className="obs-pill">Agents Pipeline</span>
         </header>
@@ -72,6 +75,9 @@ export default async function ProposalQueuePage() {
               <span>Suppressed</span>
               <strong>{suppressed}</strong>
             </div>
+          </div>
+          <div className="obs-panel-links obs-hero-links">
+            <Link href="/beliefs">Open Belief Ledger</Link>
           </div>
         </section>
 

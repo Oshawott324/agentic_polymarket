@@ -6,11 +6,14 @@ import type { PriceThresholdDecisionRule, ResolutionExtractionMode, ResolutionSp
 import {
   buildDedupeKey,
   normalizeAllowedDomainsFromUrl,
+  normalizeWorldSignalRole,
+  readSignalRole,
   type ActiveWorldEvent,
   type BeliefHypothesisProposal,
   type SimulationRunStatus,
   type WorldEntityRef,
   type WorldEntityState,
+  type WorldSignalRole,
   type WorldFactorState,
   type WorldSignal,
   type WorldStateProposal,
@@ -47,6 +50,7 @@ type EventCaseContextRow = {
 type EventCaseSignalLinkRow = {
   event_case_id: string;
   signal_id: string;
+  role: string;
 };
 
 type WorldSignalRow = {
@@ -113,6 +117,7 @@ type EventCaseContext = {
   signal_count: number;
   last_signal_at: string;
   source_signal_ids: string[];
+  signal_role_counts: Partial<Record<WorldSignalRole, number>>;
 };
 
 type CaseAnnotatedHypothesis = CaseAwareBeliefHypothesisProposal & {
@@ -298,7 +303,7 @@ async function fetchEventCaseContexts(eventCaseIds: string[]) {
     ),
     pool.query<EventCaseSignalLinkRow>(
       `
-        SELECT event_case_id, signal_id
+        SELECT event_case_id, signal_id, role
         FROM event_case_signals
         WHERE event_case_id = ANY($1::text[])
         ORDER BY event_case_id ASC, signal_id ASC
@@ -309,9 +314,16 @@ async function fetchEventCaseContexts(eventCaseIds: string[]) {
 
   const signalIdsByCase = new Map<string, string[]>();
   const eventCaseIdsBySignal = new Map<string, string[]>();
+  const signalRoleCountsByCase = new Map<string, Partial<Record<WorldSignalRole, number>>>();
   for (const row of linksResult.rows) {
     signalIdsByCase.set(row.event_case_id, [...(signalIdsByCase.get(row.event_case_id) ?? []), row.signal_id]);
     eventCaseIdsBySignal.set(row.signal_id, [...(eventCaseIdsBySignal.get(row.signal_id) ?? []), row.event_case_id]);
+    const signalRole = normalizeWorldSignalRole(row.role);
+    if (signalRole) {
+      const existing = signalRoleCountsByCase.get(row.event_case_id) ?? {};
+      existing[signalRole] = (existing[signalRole] ?? 0) + 1;
+      signalRoleCountsByCase.set(row.event_case_id, existing);
+    }
   }
 
   return {
@@ -325,6 +337,7 @@ async function fetchEventCaseContexts(eventCaseIds: string[]) {
       signal_count: Number(row.signal_count),
       last_signal_at: toIsoTimestamp(row.last_signal_at),
       source_signal_ids: signalIdsByCase.get(row.id) ?? [],
+      signal_role_counts: signalRoleCountsByCase.get(row.id) ?? {},
     })),
     eventCaseIdsBySignal,
   };
@@ -365,13 +378,32 @@ function targetTimeForSignal(signal: WorldSignal) {
   const millis = Number.isFinite(base.getTime()) ? base.getTime() : Date.now();
   const publishabilityClass = publishabilityClassForSignal(signal);
   const category = categoryForSignal(signal);
+  const signalRole = readSignalRole(signal);
   const daysAhead =
-    publishabilityClass === "sports_event" || publishabilityClass === "weather_event"
+    signalRole === "catalyst"
+      ? 1
+      : publishabilityClass === "sports_event" || publishabilityClass === "weather_event"
       ? 2
       : publishabilityClass === "official_news" || category === "sports" || category === "weather"
         ? 2
         : 3;
   return new Date(millis + daysAhead * 24 * 60 * 60 * 1000).toISOString();
+}
+
+function countRole(eventCase: EventCaseContext | null | undefined, role: WorldSignalRole) {
+  return eventCase?.signal_role_counts?.[role] ?? 0;
+}
+
+function caseHasRole(eventCase: EventCaseContext | null | undefined, role: WorldSignalRole) {
+  return countRole(eventCase, role) > 0;
+}
+
+function caseHasForecastInputs(eventCase: EventCaseContext | null | undefined) {
+  return caseHasRole(eventCase, "precursor") || caseHasRole(eventCase, "catalyst");
+}
+
+function caseIsFactOnly(eventCase: EventCaseContext | null | undefined) {
+  return Boolean(eventCase) && !caseHasForecastInputs(eventCase) && countRole(eventCase, "fact") > 0;
 }
 
 function categoryForSignal(signal: WorldSignal) {
@@ -572,8 +604,14 @@ function compareAnnotatedHypotheses(
   );
 }
 
-function scoreHypothesis(hypothesis: CaseAwareBeliefHypothesisProposal, signal: WorldSignal, eventCaseId: string | null) {
+function scoreHypothesis(
+  hypothesis: CaseAwareBeliefHypothesisProposal,
+  signal: WorldSignal,
+  eventCaseId: string | null,
+  eventCase: EventCaseContext | null,
+) {
   const category = hypothesis.category;
+  const signalRole = readSignalRole(signal);
   let score = clamp(hypothesis.confidence_score, 0, 1);
 
   if (hypothesis.machine_resolvable) {
@@ -597,6 +635,20 @@ function scoreHypothesis(hypothesis: CaseAwareBeliefHypothesisProposal, signal: 
   } else if (publishabilityClassForSignal(signal) === "sports_event") {
     score += 0.05;
   }
+  if (signalRole === "precursor") {
+    score += 0.14;
+  } else if (signalRole === "catalyst") {
+    score += 0.12;
+  } else if (signalRole === "fact") {
+    score -= 0.08;
+  } else if (signalRole === "resolution") {
+    score -= 0.18;
+  }
+  if (caseHasForecastInputs(eventCase)) {
+    score += 0.08;
+  } else if (caseIsFactOnly(eventCase) && hypothesis.hypothesis_kind === "event_occurrence") {
+    score -= 0.18;
+  }
   if (eventCaseId) {
     score += 0.04;
   }
@@ -608,15 +660,18 @@ function selectHypothesesForPersistence(
   hypotheses: CaseAwareBeliefHypothesisProposal[],
   signalMap: Map<string, WorldSignal>,
   eventCaseIdsBySignal: Map<string, string[]>,
+  eventCases: EventCaseContext[],
 ) {
   const eligibleBase = hypotheses.filter((hypothesis) => signalMap.has(hypothesis.source_signal_ids[0] ?? ""));
   const pool = eligibleBase.some((hypothesis) => hypothesis.machine_resolvable)
     ? eligibleBase.filter((hypothesis) => hypothesis.machine_resolvable)
     : eligibleBase;
+  const eventCaseMap = new Map(eventCases.map((eventCase) => [eventCase.id, eventCase]));
 
   const annotated = pool.map((hypothesis) => {
     const sourceSignal = signalMap.get(hypothesis.source_signal_ids[0] ?? "") as WorldSignal;
     const eventCaseId = eventCaseIdsBySignal.get(sourceSignal.id)?.[0] ?? null;
+    const eventCase = eventCaseId ? eventCaseMap.get(eventCaseId) ?? null : null;
     const caseFamilyKey = caseFamilyKeyForSignal(sourceSignal, eventCaseId);
     return {
       ...hypothesis,
@@ -624,12 +679,18 @@ function selectHypothesesForPersistence(
       event_case_id: eventCaseId,
       case_family_key: caseFamilyKey,
       belief_role: "primary" as const,
-      publishability_score: scoreHypothesis(hypothesis, sourceSignal, eventCaseId),
+      publishability_score: scoreHypothesis(hypothesis, sourceSignal, eventCaseId, eventCase),
     } satisfies CaseAnnotatedHypothesis;
   });
 
+  const forecastBackedCandidates = annotated.filter((candidate) => {
+    const eventCase = candidate.event_case_id ? eventCaseMap.get(candidate.event_case_id) ?? null : null;
+    return readSignalRole(candidate.source_signal) !== "fact" || caseHasForecastInputs(eventCase);
+  });
+  const rankedPool = forecastBackedCandidates.length > 0 ? forecastBackedCandidates : annotated;
+
   const bestByCase = new Map<string, CaseAnnotatedHypothesis>();
-  for (const candidate of annotated) {
+  for (const candidate of rankedPool) {
     const existing = bestByCase.get(candidate.case_family_key);
     if (!existing || compareAnnotatedHypotheses(candidate, existing) < 0) {
       bestByCase.set(candidate.case_family_key, candidate);
@@ -655,7 +716,13 @@ function selectHypothesesForPersistence(
   const representedCategories = new Set<string>();
   const hasNonPriceCandidates = candidates.some((candidate) => candidate.hypothesis_kind !== "price_threshold");
   const maxPriceSelections = hasNonPriceCandidates ? maxPriceFamiliesPerRun : Math.min(maxHypothesesPerRun, 4);
+  const hasForecastBackedCandidates = candidates.some((candidate) => {
+    const eventCase = candidate.event_case_id ? eventCaseMap.get(candidate.event_case_id) ?? null : null;
+    return readSignalRole(candidate.source_signal) !== "fact" || caseHasForecastInputs(eventCase);
+  });
+  const maxFactSelections = hasForecastBackedCandidates ? 1 : 2;
   let priceSelections = 0;
+  let factSelections = 0;
 
   const categoriesByPriority = [...new Set(candidates.map((candidate) => candidate.category))];
   for (const category of categoriesByPriority) {
@@ -669,10 +736,16 @@ function selectHypothesesForPersistence(
     if (winner.hypothesis_kind === "price_threshold" && priceSelections >= maxPriceSelections) {
       continue;
     }
+    if (readSignalRole(winner.source_signal) === "fact" && factSelections >= maxFactSelections) {
+      continue;
+    }
     selected.set(winner.id, winner);
     representedCategories.add(category);
     if (winner.hypothesis_kind === "price_threshold") {
       priceSelections += 1;
+    }
+    if (readSignalRole(winner.source_signal) === "fact") {
+      factSelections += 1;
     }
   }
 
@@ -686,12 +759,18 @@ function selectHypothesesForPersistence(
     if (candidate.hypothesis_kind === "price_threshold" && priceSelections >= maxPriceSelections) {
       continue;
     }
+    if (readSignalRole(candidate.source_signal) === "fact" && factSelections >= maxFactSelections) {
+      continue;
+    }
     if (!representedCategories.has(candidate.category) && selected.size > 0) {
       representedCategories.add(candidate.category);
     }
     selected.set(candidate.id, candidate);
     if (candidate.hypothesis_kind === "price_threshold") {
       priceSelections += 1;
+    }
+    if (readSignalRole(candidate.source_signal) === "fact") {
+      factSelections += 1;
     }
   }
 
@@ -867,6 +946,9 @@ function buildWorldModelLlmSystemPrompt() {
     "Every hypothesis must include source_signal_id, hypothesis_kind, subject, predicate, target_time, reasoning_summary, and confidence_score.",
     "For price_threshold hypotheses, always include price_threshold.operator using gt/gte/lt/lte and price_threshold.threshold.",
     "Prefer one distinct publishable belief per event case when possible.",
+    "Prefer precursor and catalyst evidence over fact-confirmation headlines when forming forecast beliefs.",
+    "Use fact signals mainly to ground the world state, not to restate events that are already complete.",
+    "When an event case has only fact signals and no precursor or catalyst, avoid post-hoc event_occurrence hypotheses unless no better forecastable cases exist.",
     "Prefer coverage across distinct source signals and source types when valid machine-resolvable signals are present.",
     "Do not emit multiple near-identical BTC hypotheses if other eligible signals are available in the same batch.",
     "Never hallucinate source ids.",
@@ -887,6 +969,7 @@ function buildWorldModelLlmUserPayload(
       summary: eventCase.summary,
       primary_entity: eventCase.primary_entity,
       source_types: eventCase.source_types,
+      signal_role_counts: eventCase.signal_role_counts,
       signal_count: eventCase.signal_count,
       last_signal_at: eventCase.last_signal_at,
       source_signal_ids: eventCase.source_signal_ids,
@@ -894,6 +977,7 @@ function buildWorldModelLlmUserPayload(
     signals: signals.map((signal) => ({
       id: signal.id,
       event_case_ids: eventCaseIdsBySignal.get(signal.id) ?? [],
+      signal_role: readSignalRole(signal),
       source_type: signal.source_type,
       title: signal.title,
       summary: signal.summary,
@@ -928,6 +1012,7 @@ async function generateWithLlm(
   }
 
   const signalMap = new Map<string, WorldSignal>(signals.map((signal) => [signal.id, signal]));
+  const eventCaseMap = new Map(eventCases.map((eventCase) => [eventCase.id, eventCase]));
   const worldStateProposal: WorldStateProposal = {
     id: randomUUID(),
     run_id: runId,
@@ -998,6 +1083,7 @@ async function generateWithLlm(
     const machineResolvable = Boolean(item.machine_resolvable ?? true) && Boolean(suggestedResolutionSpec);
     const subject = signalFields.subject;
     const eventCaseId = eventCaseIdsBySignal.get(signal.id)?.[0] ?? null;
+    const eventCase = eventCaseId ? eventCaseMap.get(eventCaseId) ?? null : null;
     const caseFamilyKey = caseFamilyKeyForSignal(signal, eventCaseId);
     const targetTime =
       typeof item.target_time === "string" && item.target_time.trim().length > 0
@@ -1041,6 +1127,7 @@ async function generateWithLlm(
         },
         signal,
         eventCaseId,
+        eventCase,
       ),
       dedupe_key: buildDedupeKey({
         kind: normalizedKind,
@@ -1061,7 +1148,7 @@ async function generateWithLlm(
     throw new Error("world_model_llm_produced_no_valid_hypotheses");
   }
 
-  const selectedHypotheses = selectHypothesesForPersistence(hypotheses, signalMap, eventCaseIdsBySignal);
+  const selectedHypotheses = selectHypothesesForPersistence(hypotheses, signalMap, eventCaseIdsBySignal, eventCases);
   if (selectedHypotheses.length === 0) {
     throw new Error("world_model_selection_produced_no_hypotheses");
   }

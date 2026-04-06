@@ -6,7 +6,9 @@ import { createDatabasePool, ensureCoreSchema, parseJsonField, toIsoTimestamp } 
 import { ProxyAgent, setGlobalDispatcher } from "undici";
 import {
   buildDedupeKey,
+  defaultSignalRoleForAdapter,
   inferEntityRefs,
+  normalizeWorldSignalRole,
   sourceAdapterToSignalType,
   type SourceAdapterKind,
   type TrustTier,
@@ -338,6 +340,35 @@ function normalizePublishCategory(value: string | null) {
   }
 }
 
+function inferSignalRole(
+  source: SourceWithConfig,
+  payload: Record<string, unknown>,
+  normalizedCategory: string | null,
+) {
+  const configuredRole = normalizeWorldSignalRole(asString(source.config_json.signal_role));
+  if (configuredRole) {
+    return configuredRole;
+  }
+
+  const payloadRole = normalizeWorldSignalRole(payload.signal_role);
+  if (payloadRole) {
+    return payloadRole;
+  }
+
+  if (source.adapter === "opencli_command" && normalizedCategory === "markets") {
+    return "precursor";
+  }
+  if (
+    (source.adapter === "opencli_command" || source.adapter === "x_api_recent_search" || source.adapter === "reddit_api_subreddit_new") &&
+    normalizedCategory &&
+    ["sports", "weather", "world", "business", "technology", "politics"].includes(normalizedCategory)
+  ) {
+    return "precursor";
+  }
+
+  return defaultSignalRoleForAdapter(source.adapter);
+}
+
 function buildSignalPayloadEnrichments(
   source: SourceWithConfig,
   input: Record<string, unknown>,
@@ -353,6 +384,7 @@ function buildSignalPayloadEnrichments(
     configuredCategory && (!payloadCategory || payloadCategory === "weather" || payloadCategory === "met")
       ? configuredCategory
       : payloadCategory ?? configuredCategory;
+  const signalRole = inferSignalRole(source, payload, normalizedCategory);
 
   const shouldDefaultAgentExtract =
     asString(payload.resolution_extraction_mode) === null &&
@@ -366,6 +398,9 @@ function buildSignalPayloadEnrichments(
     );
   if (normalizedCategory && normalizedCategory !== rawPayloadCategory?.trim().toLowerCase()) {
     enrichments.category = normalizedCategory;
+  }
+  if (signalRole && normalizeWorldSignalRole(payload.signal_role) === null) {
+    enrichments.signal_role = signalRole;
   }
 
   const extractionMode = asString(config.resolution_extraction_mode) ?? (shouldDefaultAgentExtract ? "agent_extract" : null);

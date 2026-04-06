@@ -117,6 +117,10 @@ a {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
+.obs-stats-secondary {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
 .obs-stats div {
   border: 1px solid rgba(233, 237, 244, 0.12);
   border-radius: 12px;
@@ -199,6 +203,21 @@ a {
   background: rgba(196, 64, 64, 0.2);
 }
 
+.obs-status.new {
+  color: #8ec5ff;
+  background: rgba(70, 118, 235, 0.22);
+}
+
+.obs-status.proposed {
+  color: #8ee2c8;
+  background: rgba(53, 181, 133, 0.2);
+}
+
+.obs-status.ambiguous {
+  color: #e8ca8a;
+  background: rgba(194, 147, 58, 0.2);
+}
+
 .obs-proposal-card h2 {
   font-size: 20px;
   line-height: 1.28;
@@ -215,6 +234,25 @@ a {
 .obs-proposal-card p {
   color: #aeb8c9;
   line-height: 1.5;
+}
+
+.obs-belief-details {
+  display: flex;
+  gap: 8px 12px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+  font-size: 12px;
+  color: #8f9aab;
+}
+
+.obs-belief-warning {
+  color: #f0a4a4;
+}
+
+.obs-panel-links {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
 }
 
 @media (max-width: 720px) {

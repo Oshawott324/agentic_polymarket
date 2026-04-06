@@ -22,6 +22,7 @@ export type WorldSignalSourceType =
   | "market_internal";
 
 export type TrustTier = "official" | "exchange" | "curated" | "derived";
+export type WorldSignalRole = "precursor" | "catalyst" | "fact" | "resolution";
 
 export type WorldEntityRef = {
   kind: "asset" | "institution" | "person" | "issuer" | "event";
@@ -82,6 +83,7 @@ export type WorldInputSourceConfig = {
   poll_interval_seconds: number;
   backfill_hours?: number;
   trust_tier: TrustTier;
+  signal_role?: WorldSignalRole;
 };
 
 export type SimulationRunType = "belief_refresh";
@@ -259,6 +261,55 @@ export function sourceAdapterToSignalType(adapter: SourceAdapterKind): WorldSign
     default:
       return "news";
   }
+}
+
+export function normalizeWorldSignalRole(value: unknown): WorldSignalRole | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  switch (value.trim().toLowerCase()) {
+    case "precursor":
+    case "leading":
+      return "precursor";
+    case "catalyst":
+    case "scheduled":
+      return "catalyst";
+    case "fact":
+    case "confirmed":
+      return "fact";
+    case "resolution":
+    case "resolver":
+      return "resolution";
+    default:
+      return null;
+  }
+}
+
+export function defaultSignalRoleForAdapter(adapter: SourceAdapterKind): WorldSignalRole {
+  switch (adapter) {
+    case "http_json_calendar":
+      return "catalyst";
+    case "http_json_price":
+    case "http_csv_price":
+    case "market_internal":
+      return "precursor";
+    case "x_api_recent_search":
+    case "reddit_api_subreddit_new":
+      return "precursor";
+    case "http_json_official_announcement":
+    case "http_json_filing":
+    case "news_rss":
+      return "fact";
+    case "opencli_command":
+      return "fact";
+    default:
+      return "fact";
+  }
+}
+
+export function readSignalRole(signal: Pick<WorldSignal, "payload" | "source_adapter">): WorldSignalRole {
+  return normalizeWorldSignalRole(signal.payload.signal_role) ?? defaultSignalRoleForAdapter(signal.source_adapter);
 }
 
 export function inferEntityRefs(payload: Record<string, unknown>) {

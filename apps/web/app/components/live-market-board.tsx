@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 export type MarketSummary = {
@@ -72,11 +73,21 @@ function upsertMarket(markets: MarketSummary[], candidate: MarketSummary) {
 }
 
 export function LiveMarketBoard({ initialMarkets }: { initialMarkets: MarketSummary[] }) {
+  const router = useRouter();
   const [markets, setMarkets] = useState<MarketSummary[]>(initialMarkets);
   const [streamState, setStreamState] = useState<"live" | "connecting" | "offline">("connecting");
   const [activeCategory, setActiveCategory] = useState<string>("All");
   const [query, setQuery] = useState<string>("");
   const reconnectTimer = useRef<NodeJS.Timeout | null>(null);
+
+  useEffect(() => {
+    setMarkets((current) => {
+      if (initialMarkets.length === 0 && current.length > 0) {
+        return current;
+      }
+      return initialMarkets;
+    });
+  }, [initialMarkets]);
 
   useEffect(() => {
     let disposed = false;
@@ -190,6 +201,16 @@ export function LiveMarketBoard({ initialMarkets }: { initialMarkets: MarketSumm
       }
     };
   }, []);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      router.refresh();
+    }, 15000);
+
+    return () => {
+      clearInterval(interval);
+    };
+  }, [router]);
 
   const openCount = useMemo(() => markets.filter((market) => market.status === "open").length, [markets]);
   const totalVolume = useMemo(() => markets.reduce((sum, market) => sum + Number(market.volume_24h || 0), 0), [markets]);

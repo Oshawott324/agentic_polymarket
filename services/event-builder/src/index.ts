@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import Fastify from "fastify";
 import { createDatabasePool, ensureCoreSchema, parseJsonField, toIsoTimestamp } from "@automakit/persistence";
 import {
+  readSignalRole,
   type EventCase,
   type EventCaseStatus,
   type SourceAdapterKind,
@@ -350,14 +351,14 @@ async function upsertEventCase(candidate: EventCase) {
 }
 
 async function linkSignalToCase(eventCaseId: string, signal: WorldSignal) {
-  const role = signal.source_type === "price_feed" ? "primary" : "supporting";
+  const signalRole = readSignalRole(signal);
   const linkResult = await pool.query(
     `
       INSERT INTO event_case_signals (event_case_id, signal_id, role, added_at)
       VALUES ($1, $2, $3, NOW())
       ON CONFLICT (event_case_id, signal_id) DO NOTHING
     `,
-    [eventCaseId, signal.id, role],
+    [eventCaseId, signal.id, signalRole],
   );
 
   if ((linkResult.rowCount ?? 0) === 0) {
